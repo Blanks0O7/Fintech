@@ -97,7 +97,7 @@ for profile in ['Safe', 'Neutral', 'Risky']:
 class WorkerEnv(gym.Env):
     """Worker agent: picks stocks within a risk-profile pool + Cash asset."""
     metadata = {"render_modes": []}
-    TURNOVER_LIMIT = 0.3
+    TURNOVER_LIMIT = 0.5
 
     def __init__(self, price_df, lexical_matrix, tickers, profile="neutral",
                  window_size=30, lambda_penalty=0.1, gamma_penalty=0.01):
@@ -178,7 +178,8 @@ class WorkerEnv(gym.Env):
                 port_vol = 0.0
             reward = float(log_ret - self.lambda_penalty * sem_pen - 2.0 * port_vol)
         elif self.profile == "risky":
-            reward = float(1.5 * log_ret - 0.5 * self.lambda_penalty * sem_pen)
+            # Asymmetric reward: amplify gains, dampen losses to avoid crash amplification
+            reward = float(1.5 * max(log_ret, 0) + 0.5 * min(log_ret, 0) - 0.5 * self.lambda_penalty * sem_pen)
         else:
             reward = float(log_ret - self.lambda_penalty * sem_pen - self.gamma_penalty * turnover)
 
@@ -299,14 +300,17 @@ class ManagerEnv(gym.Env):
 # EIIE NETWORK
 # ══════════════════════════════════════════════════════════════
 class EIIENetwork(nn.Module):
-    """EIIE with shared Conv1D weights + Dirichlet output."""
+    """EIIE with shared Conv1D weights, LayerNorm, Dropout + Dirichlet output."""
     def __init__(self, n_assets, window_size, n_price_assets=None):
         super().__init__()
         self.n_assets = n_assets
         self.n_price_assets = n_price_assets or n_assets
         self.conv1 = nn.Conv1d(1, 16, 3, padding=1)
         self.conv2 = nn.Conv1d(16, 32, 3, padding=1)
-        self.fc1 = nn.Linear(self.n_price_assets * 32 + n_assets, 64)
+        fc_in = self.n_price_assets * 32 + n_assets
+        self.fc1 = nn.Linear(fc_in, 64)
+        self.ln1 = nn.LayerNorm(64)
+        self.dropout = nn.Dropout(0.1)
         self.fc2 = nn.Linear(64, n_assets)
 
     def forward(self, pw, pvm):
@@ -318,7 +322,7 @@ class EIIENetwork(nn.Module):
             x = x.mean(dim=2)
             feats.append(x)
         c = torch.cat(feats + [pvm], dim=1)
-        x = F.relu(self.fc1(c))
+        x = self.dropout(F.relu(self.ln1(self.fc1(c))))
         return F.softplus(self.fc2(x)) + 1.0
 
 
@@ -429,8 +433,11 @@ def five_metric_table(returns, weights_history=None, lexical_matrix=None, label=
 # ══════════════════════════════════════════════════════════════
 # REINFORCE HELPER (used by all training phases)
 # ══════════════════════════════════════════════════════════════
+# EMA baselines: per-agent running average of episode returns for variance reduction
+_ema_baselines = {}
+
 def reinforce_update(log_probs, rewards, entropies, optimizer, net, entropy_bonus, gamma=0.99):
-    """Standard REINFORCE with baseline and entropy bonus."""
+    """REINFORCE with EMA baseline and entropy bonus (lower variance than episode-mean)."""
     if not log_probs:
         return
     G, rets = 0, []
@@ -438,8 +445,21 @@ def reinforce_update(log_probs, rewards, entropies, optimizer, net, entropy_bonu
         G = r + gamma * G
         rets.insert(0, G)
     rets = torch.FloatTensor(rets)
-    if len(rets) > 1:
-        rets = (rets - rets.mean()) / (rets.std() + 1e-8)
+
+    # EMA baseline: use per-network running average instead of episode mean
+    net_id = id(net)
+    ep_mean = float(rets.mean())
+    if net_id not in _ema_baselines:
+        _ema_baselines[net_id] = ep_mean
+    else:
+        _ema_baselines[net_id] = 0.9 * _ema_baselines[net_id] + 0.1 * ep_mean
+    baseline = _ema_baselines[net_id]
+
+    rets = rets - baseline
+    std = rets.std()
+    if std > 1e-8:
+        rets = rets / (std + 1e-8)
+
     policy_loss = sum(-lp * g for lp, g in zip(log_probs, rets))
     ent_loss = -entropy_bonus * sum(entropies)
     total_loss = policy_loss + ent_loss
@@ -500,7 +520,7 @@ def train_staged(manager_env, worker_envs,
     for ep in range(phase1_episodes):
         progress = ep / max(phase1_episodes - 1, 1)
         entropy_bonus = 0.05 * (1.0 - progress) + 0.005 * progress
-        turnover_limit = 1.0 * (1.0 - progress) + 0.3 * progress
+        turnover_limit = 1.0 * (1.0 - progress) + 0.5 * progress
         for name in pool_names:
             if name in worker_envs:
                 worker_envs[name].TURNOVER_LIMIT = turnover_limit
@@ -533,7 +553,7 @@ def train_staged(manager_env, worker_envs,
                 w_pw = torch.FloatTensor(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
                 w_pvm = torch.FloatTensor(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
                 w_alpha = net(w_pw, w_pvm).squeeze()
-                w_alpha = torch.clamp(w_alpha, min=0.1, max=100.0)
+                w_alpha = torch.clamp(w_alpha, min=1.01, max=100.0)
                 w_dist = torch.distributions.Dirichlet(w_alpha)
                 w_action = w_dist.sample()
                 w_lps[name].append(w_dist.log_prob(w_action))
@@ -602,7 +622,7 @@ def train_staged(manager_env, worker_envs,
         for name in pool_names:
             if name in worker_envs:
                 w_obs[name], _ = worker_envs[name].reset()
-                worker_envs[name].TURNOVER_LIMIT = 0.3  # Workers use tight turnover
+                worker_envs[name].TURNOVER_LIMIT = 0.5  # Workers use tight turnover
 
         m_lps, m_rews, m_entropies = [], [], []
         w_rews_track = {n: [] for n in pool_names}
@@ -622,7 +642,7 @@ def train_staged(manager_env, worker_envs,
             m_pw = torch.FloatTensor(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
             m_pvm = torch.FloatTensor(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
             m_alpha = manager_net(m_pw, m_pvm).squeeze()
-            m_alpha = torch.clamp(m_alpha, min=0.1, max=100.0)
+            m_alpha = torch.clamp(m_alpha, min=1.01, max=100.0)
             m_dist = torch.distributions.Dirichlet(m_alpha)
             m_action = m_dist.sample()
             m_lps.append(m_dist.log_prob(m_action))
@@ -694,19 +714,21 @@ def train_staged(manager_env, worker_envs,
         print("PHASE 3: Joint Fine-Tuning (all agents unfrozen)")
         print("=" * 60)
 
-    # Reset optimizers with lower LR for fine-tuning
+    # Reduce LR on existing optimizers (preserve momentum state from P1/P2)
     fine_lr = 5e-4
-    manager_opt = optim.Adam(manager_net.parameters(), lr=fine_lr)
+    for pg in manager_opt.param_groups:
+        pg['lr'] = fine_lr
     for name in pool_names:
-        if name in worker_nets:
-            worker_opts[name] = optim.Adam(worker_nets[name].parameters(), lr=fine_lr)
+        if name in worker_opts:
+            for pg in worker_opts[name].param_groups:
+                pg['lr'] = fine_lr
 
     for ep in range(phase3_episodes):
         progress = ep / max(phase3_episodes - 1, 1)
         entropy_bonus = 0.01 * (1.0 - progress) + 0.002 * progress
         for name in pool_names:
             if name in worker_envs:
-                worker_envs[name].TURNOVER_LIMIT = 0.3
+                worker_envs[name].TURNOVER_LIMIT = 0.5
 
         m_obs, _ = manager_env.reset()
         w_obs = {}
@@ -732,7 +754,7 @@ def train_staged(manager_env, worker_envs,
             m_pw = torch.FloatTensor(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
             m_pvm = torch.FloatTensor(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
             m_alpha = manager_net(m_pw, m_pvm).squeeze()
-            m_alpha = torch.clamp(m_alpha, min=0.1, max=100.0)
+            m_alpha = torch.clamp(m_alpha, min=1.01, max=100.0)
             m_dist = torch.distributions.Dirichlet(m_alpha)
             m_action = m_dist.sample()
             m_lps.append(m_dist.log_prob(m_action))
@@ -749,7 +771,7 @@ def train_staged(manager_env, worker_envs,
                 w_pw = torch.FloatTensor(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
                 w_pvm = torch.FloatTensor(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
                 w_alpha = net(w_pw, w_pvm).squeeze()
-                w_alpha = torch.clamp(w_alpha, min=0.1, max=100.0)
+                w_alpha = torch.clamp(w_alpha, min=1.01, max=100.0)
                 w_dist = torch.distributions.Dirichlet(w_alpha)
                 w_action = w_dist.sample()
                 w_lps[name].append(w_dist.log_prob(w_action))
@@ -827,7 +849,7 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
     for ep in range(n_episodes):
         progress = ep / max(n_episodes - 1, 1)
         entropy_bonus = 0.05 * (1.0 - progress) + 0.005 * progress
-        turnover_limit = 1.0 * (1.0 - progress) + 0.3 * progress
+        turnover_limit = 1.0 * (1.0 - progress) + 0.5 * progress
         for name in pool_names:
             if name in worker_envs:
                 worker_envs[name].TURNOVER_LIMIT = turnover_limit
@@ -856,7 +878,7 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
             m_pw = torch.FloatTensor(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
             m_pvm = torch.FloatTensor(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
             m_alpha = manager_net(m_pw, m_pvm).squeeze()
-            m_alpha = torch.clamp(m_alpha, min=0.1, max=100.0)
+            m_alpha = torch.clamp(m_alpha, min=1.01, max=100.0)
             m_dist = torch.distributions.Dirichlet(m_alpha)
             m_action = m_dist.sample()
             m_lps.append(m_dist.log_prob(m_action))
@@ -873,7 +895,7 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
                 w_pw = torch.FloatTensor(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
                 w_pvm = torch.FloatTensor(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
                 w_alpha = net(w_pw, w_pvm).squeeze()
-                w_alpha = torch.clamp(w_alpha, min=0.1, max=100.0)
+                w_alpha = torch.clamp(w_alpha, min=1.01, max=100.0)
                 w_dist = torch.distributions.Dirichlet(w_alpha)
                 w_action = w_dist.sample()
                 w_lps[name].append(w_dist.log_prob(w_action))
@@ -1107,9 +1129,9 @@ print("█" * 70)
 
 staged_mgr_net, staged_w_nets, staged_hist = train_staged(
     manager_env, worker_envs,
-    phase1_episodes=100,  # Workers learn stable strategies
-    phase2_episodes=80,   # Manager learns to allocate across competent Workers
-    phase3_episodes=40,   # Joint fine-tuning
+    phase1_episodes=200,  # Workers learn stable strategies
+    phase2_episodes=160,  # Manager learns to allocate across competent Workers
+    phase3_episodes=80,   # Joint fine-tuning
     lr=3e-3, max_steps=200, verbose=True
 )
 
@@ -1138,7 +1160,7 @@ manager_env_c = ManagerEnv(price_df, lexical_df, risk_pools, window_size=30)
 
 t1 = time.time()
 conc_mgr_net, conc_w_nets, conc_hist = train_concurrent(
-    manager_env_c, worker_envs_c, n_episodes=220, lr=3e-3, max_steps=200, verbose=True
+    manager_env_c, worker_envs_c, n_episodes=440, lr=3e-3, max_steps=200, verbose=True
 )
 
 # Recreate envs for eval
@@ -1154,6 +1176,60 @@ manager_env_ce = ManagerEnv(price_df, lexical_df, risk_pools, window_size=30)
 
 conc_eval = evaluate_system(manager_env_ce, worker_envs_ce, conc_mgr_net, conc_w_nets, max_steps=200)
 print(f"\nConcurrent Training Time: {time.time()-t1:.1f}s")
+
+# ─────────────────────────────────────────────────────────
+# HOLDOUT TEST SET EVALUATION (last 20% of data, unseen)
+# ─────────────────────────────────────────────────────────
+print("\n" + "█" * 70)
+print("  HOLDOUT TEST-SET EVALUATION (last 20% of data)")
+print("█" * 70)
+
+split_idx = int(len(price_df) * 0.8)
+test_prices = price_df.iloc[split_idx:]
+print(f"  Test period: {test_prices.index[0].date()} -> {test_prices.index[-1].date()} ({len(test_prices)} days)")
+
+# Staged on holdout
+holdout_worker_envs = {}
+for profile in ['Safe', 'Neutral', 'Risky']:
+    pool_tickers = risk_pools[profile]
+    valid_t = [t for t in pool_tickers if t in test_prices.columns]
+    if len(valid_t) >= 2:
+        holdout_worker_envs[profile] = WorkerEnv(
+            test_prices, lexical_df, valid_t,
+            profile=profile.lower(), window_size=30,
+            lambda_penalty=0.1, gamma_penalty=0.01)
+holdout_mgr_env = ManagerEnv(test_prices, lexical_df, risk_pools, window_size=30)
+holdout_staged_eval = evaluate_system(holdout_mgr_env, holdout_worker_envs, staged_mgr_net, staged_w_nets, max_steps=200)
+
+# Concurrent on holdout
+holdout_worker_envs_c = {}
+for profile in ['Safe', 'Neutral', 'Risky']:
+    pool_tickers = risk_pools[profile]
+    valid_t = [t for t in pool_tickers if t in test_prices.columns]
+    if len(valid_t) >= 2:
+        holdout_worker_envs_c[profile] = WorkerEnv(
+            test_prices, lexical_df, valid_t,
+            profile=profile.lower(), window_size=30,
+            lambda_penalty=0.1, gamma_penalty=0.01)
+holdout_mgr_env_c = ManagerEnv(test_prices, lexical_df, risk_pools, window_size=30)
+holdout_conc_eval = evaluate_system(holdout_mgr_env_c, holdout_worker_envs_c, conc_mgr_net, conc_w_nets, max_steps=200)
+
+# EW/MVO on holdout
+holdout_valid_tickers = [t for t in tickers if t in test_prices.columns]
+holdout_ew_rets, _ = equal_weight_baseline(test_prices, holdout_valid_tickers, window_size=30)
+holdout_mvo_rets, _ = mvo_baseline(test_prices, holdout_valid_tickers, window_size=30)
+
+holdout_min_len = min(len(holdout_staged_eval['global_returns']), len(holdout_ew_rets), len(holdout_mvo_rets))
+print(f"\n  HOLDOUT RESULTS (unseen test data):")
+print(f"  {'Method':<20} | {'Return':>10} | {'Sharpe':>10} | {'Sortino':>10} | {'MaxDD':>10}")
+print(f"  {'-'*70}")
+for label, rets in [('Staged MARL', holdout_staged_eval['global_returns'][:holdout_min_len]),
+                     ('Concurrent MARL', holdout_conc_eval['global_returns'][:holdout_min_len]),
+                     ('Equal-Weight', holdout_ew_rets[:holdout_min_len]),
+                     ('MVO', holdout_mvo_rets[:holdout_min_len])]:
+    r = np.array(rets)
+    print(f"  {label:<20} | {compute_cumulative_return(r):>+10.4f} | {compute_sharpe(r):>10.4f} | "
+          f"{compute_sortino(r):>10.4f} | {compute_max_drawdown(r):>10.4f}")
 
 # ─────────────────────────────────────────────────────────
 # C) BASELINES
@@ -1322,7 +1398,7 @@ for wf_name, train_s, train_e, test_s, test_e in wf_windows:
     # Staged training for walk-forward (reduced episodes for speed)
     wf_mgr_net, wf_w_nets, _ = train_staged(
         wf_mgr_env, wf_worker_envs,
-        phase1_episodes=60, phase2_episodes=40, phase3_episodes=20,
+        phase1_episodes=120, phase2_episodes=80, phase3_episodes=40,
         verbose=False
     )
 
@@ -1380,7 +1456,7 @@ for lam in lambdas:
     abl_mgr_env = ManagerEnv(price_df, lexical_df, risk_pools, window_size=30)
     abl_mgr_net, abl_w_nets, _ = train_staged(
         abl_mgr_env, abl_worker_envs,
-        phase1_episodes=60, phase2_episodes=40, phase3_episodes=20,
+        phase1_episodes=120, phase2_episodes=80, phase3_episodes=40,
         verbose=False
     )
 
@@ -1574,7 +1650,7 @@ all_results = {
     'experiment': 'Staged vs Concurrent MARL Training',
     'total_runtime_seconds': time.time() - t0,
     'staged_training': {
-        'phases': '100W + 80M + 40J = 220 total',
+        'phases': '200W + 160M + 80J = 440 total',
         'global_metrics': {k: to_serializable(v) for k, v in staged_eval.items()
                           if k not in ('global_returns', 'allocations', 'worker_weights', 'worker_results')},
         'allocation': {name: float(staged_eval['avg_allocation'][i])
@@ -1583,7 +1659,7 @@ all_results = {
                           for name, wr in staged_eval['worker_results'].items()},
     },
     'concurrent_training': {
-        'episodes': 600,
+        'episodes': 440,
         'global_metrics': {k: to_serializable(v) for k, v in conc_eval.items()
                           if k not in ('global_returns', 'allocations', 'worker_weights', 'worker_results')},
         'allocation': {name: float(conc_eval['avg_allocation'][i])
@@ -1613,6 +1689,23 @@ all_results = {
             'sharpe': float(compute_sharpe(mvo_returns_trim)),
             'sortino': float(compute_sortino(mvo_returns_trim)),
             'max_drawdown': float(compute_max_drawdown(mvo_returns_trim)),
+        },
+    },
+    'holdout_test': {
+        'test_period': f"{test_prices.index[0].date()} to {test_prices.index[-1].date()}",
+        'staged': {
+            'cumulative_return': float(compute_cumulative_return(holdout_staged_eval['global_returns'][:holdout_min_len])),
+            'sharpe': float(compute_sharpe(holdout_staged_eval['global_returns'][:holdout_min_len])),
+            'sortino': float(compute_sortino(holdout_staged_eval['global_returns'][:holdout_min_len])),
+            'max_drawdown': float(compute_max_drawdown(holdout_staged_eval['global_returns'][:holdout_min_len])),
+        },
+        'concurrent': {
+            'cumulative_return': float(compute_cumulative_return(holdout_conc_eval['global_returns'][:holdout_min_len])),
+            'sharpe': float(compute_sharpe(holdout_conc_eval['global_returns'][:holdout_min_len])),
+        },
+        'equal_weight': {
+            'cumulative_return': float(compute_cumulative_return(holdout_ew_rets[:holdout_min_len])),
+            'sharpe': float(compute_sharpe(holdout_ew_rets[:holdout_min_len])),
         },
     },
 }
