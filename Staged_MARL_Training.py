@@ -1,22 +1,24 @@
 """
-Staged MARL Training — Curriculum Learning for Hierarchical Portfolio Management
+Staged MARL Training - Curriculum Learning for Hierarchical Portfolio Management
 ================================================================================
 Author: Radheshyam Subedi | Student ID: U2829927
+
+Dataset: 100 S&P 500 stocks (93 after filtering)
 
 KEY IMPROVEMENT: Implements staged/curriculum training to solve the
 instability of training interdependent agents simultaneously.
 
 Training Phases:
-  Phase 1 — Train Workers (Manager frozen at 1/3 equal allocation)
-  Phase 2 — Train Manager (Workers frozen with learned policies)
-  Phase 3 — Fine-tune all agents together (joint optimization)
+  Phase 1 - Train Workers (Manager frozen at 1/3 equal allocation)
+  Phase 2 - Train Manager (Workers frozen with learned policies)
+  Phase 3 - Fine-tune all agents together (joint optimization)
 
 Evaluation: 5-Metric Thesis Table
-  1. Cumulative Return    — raw total profit
-  2. Sharpe Ratio         — risk-adjusted return (total volatility)
-  3. Sortino Ratio        — risk-adjusted return (downside volatility only)
-  4. Maximum Drawdown     — worst peak-to-trough loss
-  5. Lexical Ratio (HHI)  — semantic diversification measure
+  1. Cumulative Return    - raw total profit
+  2. Sharpe Ratio         - risk-adjusted return (total volatility)
+  3. Sortino Ratio        - risk-adjusted return (downside volatility only)
+  4. Maximum Drawdown     - worst peak-to-trough loss
+  5. Lexical Ratio (HHI)  - semantic diversification measure
 
 Comparisons:
   - Staged MARL vs Concurrent MARL (existing)
@@ -47,16 +49,16 @@ SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # DATA LOADING
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 print("=" * 70)
-print("STAGED MARL TRAINING — Curriculum Learning")
+print("STAGED MARL TRAINING - Curriculum Learning")
 print("=" * 70)
 
-price_df = pd.read_csv("data/sp500_50_prices.csv", index_col=0, parse_dates=True)
-lexical_df = pd.read_csv("data/processed/lexical_matrix_50.csv", index_col=0)
-with open("data/processed/sector_map_50.json") as f:
+price_df = pd.read_csv("data/sp500_100_prices.csv", index_col=0, parse_dates=True)
+lexical_df = pd.read_csv("data/processed/lexical_matrix_100.csv", index_col=0)
+with open("data/processed/sector_map_100.json") as f:
     sector_map = json.load(f)
 
 tickers = list(price_df.columns)
@@ -85,15 +87,15 @@ for ticker, beta in betas.items():
         beta_labels[ticker] = 'Risky'
 
 print(f"\nStocks: {n_stocks}")
-print(f"Date range: {price_df.index[0].date()} → {price_df.index[-1].date()}")
+print(f"Date range: {price_df.index[0].date()} -> {price_df.index[-1].date()}")
 for profile in ['Safe', 'Neutral', 'Risky']:
     avg_b = np.mean([betas[t] for t in risk_pools[profile]])
-    print(f"  {profile}: {len(risk_pools[profile])} stocks (avg β={avg_b:.3f})")
+    print(f"  {profile}: {len(risk_pools[profile])} stocks (avg beta={avg_b:.3f})")
 
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # ENVIRONMENTS
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 class WorkerEnv(gym.Env):
     """Worker agent: picks stocks within a risk-profile pool + Cash asset."""
     metadata = {"render_modes": []}
@@ -296,9 +298,9 @@ class ManagerEnv(gym.Env):
         ]).astype(np.float32)
 
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # EIIE NETWORK
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 class EIIENetwork(nn.Module):
     """EIIE with shared Conv1D weights, LayerNorm, Dropout + Dirichlet output."""
     def __init__(self, n_assets, window_size, n_price_assets=None):
@@ -326,9 +328,9 @@ class EIIENetwork(nn.Module):
         return F.softplus(self.fc2(x)) + 1.0
 
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # RISK METRICS
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 def compute_max_drawdown(returns):
     cum = np.cumprod(1 + returns)
     peak = np.maximum.accumulate(cum)
@@ -430,9 +432,9 @@ def five_metric_table(returns, weights_history=None, lexical_matrix=None, label=
     }
 
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # REINFORCE HELPER (used by all training phases)
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # EMA baselines: per-agent running average of episode returns for variance reduction
 _ema_baselines = {}
 
@@ -469,9 +471,9 @@ def reinforce_update(log_probs, rewards, entropies, optimizer, net, entropy_bonu
     optimizer.step()
 
 
-# ══════════════════════════════════════════════════════════════
-# STAGED TRAINING — THE KEY IMPROVEMENT
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
+# STAGED TRAINING - THE KEY IMPROVEMENT
+# ==============================================================
 def train_staged(manager_env, worker_envs, 
                  phase1_episodes=300, phase2_episodes=200, phase3_episodes=100,
                  lr=3e-3, max_steps=200, verbose=True):
@@ -501,9 +503,9 @@ def train_staged(manager_env, worker_envs,
     hist = {'phase': [], 'manager_rewards': [], 'worker_rewards': {n: [] for n in pool_names},
             'global_returns': [], 'allocations': [], 'phase_boundaries': []}
 
-    # ─────────────────────────────────────────────────────────
+    # ---------------------------------------------------------
     # PHASE 1: Train Workers, Manager frozen at 1/3 equal
-    # ─────────────────────────────────────────────────────────
+    # ---------------------------------------------------------
     if verbose:
         print("\n" + "=" * 60)
         print("PHASE 1: Training Workers (Manager FROZEN at 1/3 equal)")
@@ -596,9 +598,9 @@ def train_staged(manager_env, worker_envs,
     if verbose:
         print(f"  Phase 1 complete: {phase1_episodes} episodes")
 
-    # ─────────────────────────────────────────────────────────
+    # ---------------------------------------------------------
     # PHASE 2: Train Manager, Workers frozen
-    # ─────────────────────────────────────────────────────────
+    # ---------------------------------------------------------
     if verbose:
         print("\n" + "=" * 60)
         print("PHASE 2: Training Manager (Workers FROZEN)")
@@ -706,9 +708,9 @@ def train_staged(manager_env, worker_envs,
     if verbose:
         print(f"  Phase 2 complete: {phase2_episodes} episodes")
 
-    # ─────────────────────────────────────────────────────────
+    # ---------------------------------------------------------
     # PHASE 3: Joint fine-tuning (all unfrozen)
-    # ─────────────────────────────────────────────────────────
+    # ---------------------------------------------------------
     if verbose:
         print("\n" + "=" * 60)
         print("PHASE 3: Joint Fine-Tuning (all agents unfrozen)")
@@ -822,9 +824,9 @@ def train_staged(manager_env, worker_envs,
     return manager_net, worker_nets, hist
 
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # CONCURRENT TRAINING (existing baseline for comparison)
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_steps=200, verbose=False):
     """Original concurrent training (all agents train simultaneously)."""
     pool_names = ['Safe', 'Neutral', 'Risky']
@@ -939,9 +941,9 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
     return manager_net, worker_nets, hist
 
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # EVALUATION
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 def evaluate_system(manager_env, worker_envs, manager_net, worker_nets, max_steps=200):
     """Evaluate full hierarchy. Returns daily returns + weight history."""
     pool_names = ['Safe', 'Neutral', 'Risky']
@@ -1035,9 +1037,9 @@ def evaluate_system(manager_env, worker_envs, manager_net, worker_nets, max_step
     return result
 
 
-# ══════════════════════════════════════════════════════════════
-# BASELINES: Equal-Weight and Mean-Variance Optimization
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
+# BASELINES: Equal-Weight, MVO, Risk Parity, Momentum
+# ==============================================================
 def equal_weight_baseline(price_df, tickers, window_size=30):
     """Simple 1/N equal-weight buy-and-hold baseline."""
     prices = price_df[tickers].values
@@ -1101,9 +1103,75 @@ def mvo_baseline(price_df, tickers, window_size=30, lookback=120):
     return np.array(rets_all), np.array(weights_all)
 
 
-# ══════════════════════════════════════════════════════════════
+def risk_parity_baseline(price_df, tickers, window_size=30, lookback=60):
+    """Risk Parity (Inverse Volatility Weighting) baseline.
+    Weights each stock proportionally to 1/sigma - lower-volatility stocks get more capital.
+    Rebalances daily using a rolling lookback window for volatility estimation.
+    This is the most popular institutional portfolio strategy (Bridgewater All Weather)."""
+    prices = price_df[tickers].values
+    n = len(tickers)
+    rets_all = []
+    weights_all = []
+
+    for t in range(window_size, len(prices) - 1):
+        start = max(0, t - lookback)
+        hist_prices = prices[start:t+1]
+        if len(hist_prices) < 20:
+            w = np.ones(n) / n
+        else:
+            hist_rets = np.diff(hist_prices, axis=0) / (hist_prices[:-1] + 1e-8)
+            vols = np.std(hist_rets, axis=0)
+            # Inverse volatility weighting: w_i = (1/sigma_i) / sigma(1/sigma_j)
+            inv_vol = 1.0 / (vols + 1e-8)
+            w = inv_vol / np.sum(inv_vol)
+
+        curr = prices[t]
+        nxt = prices[t + 1]
+        pr = nxt / (curr + 1e-8)
+        port_ret = np.dot(w, pr) - 1.0
+        rets_all.append(port_ret)
+        weights_all.append(w.copy())
+
+    return np.array(rets_all), np.array(weights_all)
+
+
+def momentum_baseline(price_df, tickers, window_size=30, lookback=60, top_pct=0.5):
+    """Cross-Sectional Momentum baseline.
+    Ranks stocks by their past N-day return, then overweights recent winners.
+    Top 50% of stocks (by momentum) get 2/N weight, bottom 50% get 0.
+    This is a classic active strategy from Jegadeesh & Titman (1993)."""
+    prices = price_df[tickers].values
+    n = len(tickers)
+    rets_all = []
+    weights_all = []
+    n_top = max(1, int(n * top_pct))
+
+    for t in range(window_size, len(prices) - 1):
+        start = max(0, t - lookback)
+        if t - start < 5:
+            w = np.ones(n) / n
+        else:
+            # Momentum signal: total return over lookback period
+            mom = prices[t] / (prices[start] + 1e-8) - 1.0
+            # Rank stocks: top_pct get equal weight, bottom get 0
+            ranked = np.argsort(mom)[::-1]  # descending
+            w = np.zeros(n)
+            w[ranked[:n_top]] = 1.0 / n_top
+
+        curr = prices[t]
+        nxt = prices[t + 1]
+        pr = nxt / (curr + 1e-8)
+        port_ret = np.dot(w, pr) - 1.0
+        rets_all.append(port_ret)
+        weights_all.append(w.copy())
+
+    return np.array(rets_all), np.array(weights_all)
+
+
+
+# ==============================================================
 # MAIN EXECUTION
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 t0 = time.time()
 
 # Create environments
@@ -1120,12 +1188,12 @@ for profile in ['Safe', 'Neutral', 'Risky']:
 manager_env = ManagerEnv(price_df, lexical_df, risk_pools, window_size=30)
 print(f"  Manager: allocating across {len(worker_envs)} risk pools\n")
 
-# ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------
 # A) STAGED TRAINING (new approach)
-# ─────────────────────────────────────────────────────────
-print("\n" + "█" * 70)
+# ---------------------------------------------------------
+print("\n" + "#" * 70)
 print("  EXPERIMENT A: STAGED/CURRICULUM TRAINING")
-print("█" * 70)
+print("#" * 70)
 
 staged_mgr_net, staged_w_nets, staged_hist = train_staged(
     manager_env, worker_envs,
@@ -1139,12 +1207,12 @@ staged_mgr_net, staged_w_nets, staged_hist = train_staged(
 staged_eval = evaluate_system(manager_env, worker_envs, staged_mgr_net, staged_w_nets, max_steps=200)
 print(f"\nStaged Training Time: {time.time()-t0:.1f}s")
 
-# ─────────────────────────────────────────────────────────
-# B) CONCURRENT TRAINING (existing approach — for comparison)
-# ─────────────────────────────────────────────────────────
-print("\n" + "█" * 70)
+# ---------------------------------------------------------
+# B) CONCURRENT TRAINING (existing approach - for comparison)
+# ---------------------------------------------------------
+print("\n" + "#" * 70)
 print("  EXPERIMENT B: CONCURRENT TRAINING (baseline)")
-print("█" * 70)
+print("#" * 70)
 
 # Recreate fresh environments for fair comparison
 worker_envs_c = {}
@@ -1177,12 +1245,12 @@ manager_env_ce = ManagerEnv(price_df, lexical_df, risk_pools, window_size=30)
 conc_eval = evaluate_system(manager_env_ce, worker_envs_ce, conc_mgr_net, conc_w_nets, max_steps=200)
 print(f"\nConcurrent Training Time: {time.time()-t1:.1f}s")
 
-# ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------
 # HOLDOUT TEST SET EVALUATION (last 20% of data, unseen)
-# ─────────────────────────────────────────────────────────
-print("\n" + "█" * 70)
+# ---------------------------------------------------------
+print("\n" + "#" * 70)
 print("  HOLDOUT TEST-SET EVALUATION (last 20% of data)")
-print("█" * 70)
+print("#" * 70)
 
 split_idx = int(len(price_df) * 0.8)
 test_prices = price_df.iloc[split_idx:]
@@ -1218,44 +1286,54 @@ holdout_conc_eval = evaluate_system(holdout_mgr_env_c, holdout_worker_envs_c, co
 holdout_valid_tickers = [t for t in tickers if t in test_prices.columns]
 holdout_ew_rets, _ = equal_weight_baseline(test_prices, holdout_valid_tickers, window_size=30)
 holdout_mvo_rets, _ = mvo_baseline(test_prices, holdout_valid_tickers, window_size=30)
+holdout_rp_rets, _ = risk_parity_baseline(test_prices, holdout_valid_tickers, window_size=30)
+holdout_mom_rets, _ = momentum_baseline(test_prices, holdout_valid_tickers, window_size=30)
 
-holdout_min_len = min(len(holdout_staged_eval['global_returns']), len(holdout_ew_rets), len(holdout_mvo_rets))
+holdout_min_len = min(len(holdout_staged_eval['global_returns']), len(holdout_ew_rets),
+                      len(holdout_mvo_rets), len(holdout_rp_rets), len(holdout_mom_rets))
 print(f"\n  HOLDOUT RESULTS (unseen test data):")
 print(f"  {'Method':<20} | {'Return':>10} | {'Sharpe':>10} | {'Sortino':>10} | {'MaxDD':>10}")
 print(f"  {'-'*70}")
 for label, rets in [('Staged MARL', holdout_staged_eval['global_returns'][:holdout_min_len]),
                      ('Concurrent MARL', holdout_conc_eval['global_returns'][:holdout_min_len]),
                      ('Equal-Weight', holdout_ew_rets[:holdout_min_len]),
-                     ('MVO', holdout_mvo_rets[:holdout_min_len])]:
+                     ('MVO', holdout_mvo_rets[:holdout_min_len]),
+                     ('Risk Parity', holdout_rp_rets[:holdout_min_len]),
+                     ('Momentum', holdout_mom_rets[:holdout_min_len])]:
     r = np.array(rets)
     print(f"  {label:<20} | {compute_cumulative_return(r):>+10.4f} | {compute_sharpe(r):>10.4f} | "
           f"{compute_sortino(r):>10.4f} | {compute_max_drawdown(r):>10.4f}")
 
-# ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------
 # C) BASELINES
-# ─────────────────────────────────────────────────────────
-print("\n" + "█" * 70)
-print("  BASELINES: Equal-Weight (1/N) & Mean-Variance Optimization")
-print("█" * 70)
+# ---------------------------------------------------------
+print("\n" + "#" * 70)
+print("  BASELINES: Equal-Weight, MVO, Risk Parity, Momentum")
+print("#" * 70)
 
 # All tickers for baselines
 valid_tickers = [t for t in tickers if t in price_df.columns]
 ew_returns, ew_weights = equal_weight_baseline(price_df, valid_tickers, window_size=30)
 mvo_returns, mvo_weights = mvo_baseline(price_df, valid_tickers, window_size=30)
+rp_returns, rp_weights = risk_parity_baseline(price_df, valid_tickers, window_size=30)
+mom_returns, mom_weights = momentum_baseline(price_df, valid_tickers, window_size=30)
 
 # Truncate to same length as MARL eval for fair comparison
-min_len = min(len(staged_eval['global_returns']), len(ew_returns), len(mvo_returns))
+min_len = min(len(staged_eval['global_returns']), len(ew_returns), len(mvo_returns),
+              len(rp_returns), len(mom_returns))
 ew_returns_trim = ew_returns[:min_len]
 mvo_returns_trim = mvo_returns[:min_len]
+rp_returns_trim = rp_returns[:min_len]
+mom_returns_trim = mom_returns[:min_len]
 staged_returns_trim = staged_eval['global_returns'][:min_len]
 conc_returns_trim = conc_eval['global_returns'][:min_len]
 
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # 5-METRIC THESIS TABLE
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 print("\n" + "=" * 90)
-print("  FIVE-METRIC THESIS TABLE — Master's Degree Standard")
+print("  FIVE-METRIC THESIS TABLE - Master's Degree Standard")
 print("=" * 90)
 
 # Compute HHI for MARL systems (using Worker stock weights)
@@ -1287,6 +1365,12 @@ ew_effn = len(valid_tickers)
 mvo_avg_w = np.mean(mvo_weights, axis=0) if len(mvo_weights) > 0 else np.ones(len(valid_tickers)) / len(valid_tickers)
 mvo_hhi = compute_hhi(mvo_avg_w)
 mvo_effn = compute_effective_n(mvo_avg_w)
+rp_avg_w = np.mean(rp_weights, axis=0) if len(rp_weights) > 0 else np.ones(len(valid_tickers)) / len(valid_tickers)
+rp_hhi = compute_hhi(rp_avg_w)
+rp_effn = compute_effective_n(rp_avg_w)
+mom_avg_w = np.mean(mom_weights, axis=0) if len(mom_weights) > 0 else np.ones(len(valid_tickers)) / len(valid_tickers)
+mom_hhi = compute_hhi(mom_avg_w)
+mom_effn = compute_effective_n(mom_avg_w)
 
 # Build table rows
 metrics_table = {
@@ -1322,17 +1406,34 @@ metrics_table = {
         'HHI (Lexical)': mvo_hhi,
         'Effective N': mvo_effn,
     },
+    'Risk Parity': {
+        'Cumulative Return': compute_cumulative_return(rp_returns_trim),
+        'Sharpe Ratio': compute_sharpe(rp_returns_trim),
+        'Sortino Ratio': compute_sortino(rp_returns_trim),
+        'Max Drawdown': compute_max_drawdown(rp_returns_trim),
+        'HHI (Lexical)': rp_hhi,
+        'Effective N': rp_effn,
+    },
+    'Momentum': {
+        'Cumulative Return': compute_cumulative_return(mom_returns_trim),
+        'Sharpe Ratio': compute_sharpe(mom_returns_trim),
+        'Sortino Ratio': compute_sortino(mom_returns_trim),
+        'Max Drawdown': compute_max_drawdown(mom_returns_trim),
+        'HHI (Lexical)': mom_hhi,
+        'Effective N': mom_effn,
+    },
 }
 
 # Print formatted table
-header = f"{'Metric':<22} | {'Staged MARL':>14} | {'Concurrent MARL':>16} | {'Equal-Weight':>14} | {'MVO':>14}"
+all_methods = ['Staged MARL', 'Concurrent MARL', 'Equal-Weight (1/N)', 'MVO (Markowitz)', 'Risk Parity', 'Momentum']
+header = f"{'Metric':<22} | {'Staged':<10} | {'Concurrent':<10} | {'EqWt':<10} | {'MVO':<10} | {'RiskPar':<10} | {'Momentum':<10}"
 print(header)
 print("-" * len(header))
 
 metric_keys = ['Cumulative Return', 'Sharpe Ratio', 'Sortino Ratio', 'Max Drawdown', 'HHI (Lexical)', 'Effective N']
 for mk in metric_keys:
     vals = []
-    for method in ['Staged MARL', 'Concurrent MARL', 'Equal-Weight (1/N)', 'MVO (Markowitz)']:
+    for method in all_methods:
         v = metrics_table[method][mk]
         if mk == 'Cumulative Return':
             vals.append(f"{v:+.2%}")
@@ -1342,9 +1443,9 @@ for mk in metric_keys:
             vals.append(f"{v:.1f}")
         else:
             vals.append(f"{v:.4f}")
-    print(f"{mk:<22} | {vals[0]:>14} | {vals[1]:>16} | {vals[2]:>14} | {vals[3]:>14}")
+    print(f"{mk:<22} | {vals[0]:<10} | {vals[1]:<10} | {vals[2]:<10} | {vals[3]:<10} | {vals[4]:<10} | {vals[5]:<10}")
 
-# ─────── Worker-level breakdown ───────
+# ------- Worker-level breakdown -------
 print("\n" + "=" * 90)
 print("  WORKER-LEVEL PERFORMANCE (Staged MARL)")
 print("=" * 90)
@@ -1359,18 +1460,18 @@ for name in ['Safe', 'Neutral', 'Risky']:
 print(f"\nManager Allocation (Staged): Safe={staged_eval['avg_allocation'][0]:.2%}, "
       f"Neutral={staged_eval['avg_allocation'][1]:.2%}, Risky={staged_eval['avg_allocation'][2]:.2%}")
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # WALK-FORWARD VALIDATION (with staged training)
-# ══════════════════════════════════════════════════════════════
-print("\n" + "█" * 70)
+# ==============================================================
+print("\n" + "#" * 70)
 print("  WALK-FORWARD VALIDATION (Staged Training)")
-print("█" * 70)
+print("#" * 70)
 
 wf_windows = [
-    ("2015-2018 → 2019 (Bull)", "2015-01-01", "2019-01-01", "2019-01-01", "2020-01-01"),
-    ("2015-2019 → 2020 (COVID)", "2015-01-01", "2020-01-01", "2020-01-01", "2021-01-01"),
-    ("2015-2020 → 2021 (Recovery)", "2015-01-01", "2021-01-01", "2021-01-01", "2022-01-01"),
-    ("2015-2021 → 2022 (Bear)", "2015-01-01", "2022-01-01", "2022-01-01", "2023-01-01"),
+    ("2015-2018 -> 2019 (Bull)", "2015-01-01", "2019-01-01", "2019-01-01", "2020-01-01"),
+    ("2015-2019 -> 2020 (COVID)", "2015-01-01", "2020-01-01", "2020-01-01", "2021-01-01"),
+    ("2015-2020 -> 2021 (Recovery)", "2015-01-01", "2021-01-01", "2021-01-01", "2022-01-01"),
+    ("2015-2021 -> 2022 (Bear)", "2015-01-01", "2022-01-01", "2022-01-01", "2023-01-01"),
 ]
 
 wf_results = {}
@@ -1380,7 +1481,7 @@ for wf_name, train_s, train_e, test_s, test_e in wf_windows:
     test_prices = price_df.loc[test_s:test_e]
 
     if len(train_prices) < 60 or len(test_prices) < 20:
-        print(f"  Skipping — insufficient data")
+        print(f"  Skipping - insufficient data")
         continue
 
     wf_worker_envs = {}
@@ -1428,22 +1529,22 @@ if wf_results:
     print(f"{'Window':<30} | {'CumRet':>10} | {'Sharpe':>10} | {'Sortino':>10} | {'MaxDD':>10} | {'CVaR95':>10}")
     print("-" * 95)
     for wf_name, ev in wf_results.items():
-        short = wf_name.split('→')[1].strip()[:20] if '→' in wf_name else wf_name[:20]
+        short = wf_name.split('->')[1].strip()[:20] if '->' in wf_name else wf_name[:20]
         print(f"{short:<30} | {ev['total_return']:>+10.4f} | {ev['sharpe']:>10.4f} | "
               f"{ev['sortino']:>10.4f} | {ev['max_drawdown']:>10.4f} | {ev['cvar_95']:>10.4f}")
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # LAMBDA ABLATION (with staged training)
-# ══════════════════════════════════════════════════════════════
-print("\n" + "█" * 70)
+# ==============================================================
+print("\n" + "#" * 70)
 print("  LAMBDA ABLATION (Staged Training)")
-print("█" * 70)
+print("#" * 70)
 
 lambdas = [0.0, 0.1, 0.5]
 ablation_results = {}
 
 for lam in lambdas:
-    print(f"\n  λ = {lam}...")
+    print(f"\n  lambda = {lam}...")
     abl_worker_envs = {}
     for profile in ['Safe', 'Neutral', 'Risky']:
         pool_tickers = risk_pools[profile]
@@ -1491,14 +1592,14 @@ for lam in lambdas:
           f"{alloc[0]:>5.1%}/{alloc[1]:>5.1%}/{alloc[2]:>5.1%}")
 
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # PLOTS
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 print("\n\nGenerating plots...")
 
 # Figure 1: Training curves by phase
 fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-fig.suptitle("Staged MARL Training — Curriculum Learning", fontsize=14, fontweight='bold')
+fig.suptitle("Staged MARL Training - Curriculum Learning", fontsize=14, fontweight='bold')
 
 # Manager reward by phase
 ax = axes[0, 0]
@@ -1536,24 +1637,26 @@ ax.plot(np.cumprod(1 + staged_returns_trim), label='Staged MARL', color='blue', 
 ax.plot(np.cumprod(1 + conc_returns_trim), label='Concurrent MARL', color='orange', linewidth=1.5, alpha=0.8)
 ax.plot(np.cumprod(1 + ew_returns_trim), label='Equal-Weight', color='grey', linewidth=1, alpha=0.7)
 ax.plot(np.cumprod(1 + mvo_returns_trim), label='MVO', color='purple', linewidth=1, alpha=0.7)
+ax.plot(np.cumprod(1 + rp_returns_trim), label='Risk Parity', color='teal', linewidth=1, alpha=0.7)
+ax.plot(np.cumprod(1 + mom_returns_trim), label='Momentum', color='crimson', linewidth=1, alpha=0.7)
 ax.axhline(1.0, color='black', linestyle='--', alpha=0.3)
 ax.set_xlabel('Trading Day')
 ax.set_ylabel('Cumulative Value ($1)')
-ax.set_title('Equity Curves: Staged vs Concurrent vs Baselines')
-ax.legend(fontsize=8)
+ax.set_title('Equity Curves: All Methods')
+ax.legend(fontsize=7)
 ax.grid(alpha=0.3)
 
 # 5-metric bar chart
 ax = axes[1, 1]
-methods = ['Staged\nMARL', 'Concurrent\nMARL', 'Equal\nWeight', 'MVO']
-sharpes = [metrics_table[m]['Sharpe Ratio'] for m in ['Staged MARL', 'Concurrent MARL', 'Equal-Weight (1/N)', 'MVO (Markowitz)']]
-sortinos = [metrics_table[m]['Sortino Ratio'] for m in ['Staged MARL', 'Concurrent MARL', 'Equal-Weight (1/N)', 'MVO (Markowitz)']]
+methods = ['Staged\nMARL', 'Conc.\nMARL', 'Equal\nWeight', 'MVO', 'Risk\nParity', 'Mom.']
+sharpes = [metrics_table[m]['Sharpe Ratio'] for m in all_methods]
+sortinos = [metrics_table[m]['Sortino Ratio'] for m in all_methods]
 x = np.arange(len(methods))
 w_bar = 0.35
 ax.bar(x - w_bar/2, sharpes, w_bar, label='Sharpe', color='steelblue', alpha=0.8)
 ax.bar(x + w_bar/2, sortinos, w_bar, label='Sortino', color='coral', alpha=0.8)
 ax.set_xticks(x)
-ax.set_xticklabels(methods, fontsize=9)
+ax.set_xticklabels(methods, fontsize=7)
 ax.set_ylabel('Ratio')
 ax.set_title('Sharpe & Sortino Comparison')
 ax.legend()
@@ -1568,7 +1671,7 @@ fig, axes = plt.subplots(1, 2, figsize=(16, 5))
 
 if wf_results:
     ax = axes[0]
-    wf_names_short = [w.split('→')[1].strip()[:15] if '→' in w else w[:15] for w in wf_results.keys()]
+    wf_names_short = [w.split('->')[1].strip()[:15] if '->' in w else w[:15] for w in wf_results.keys()]
     wf_rets = [wf_results[w]['total_return'] for w in wf_results]
     wf_sharpes = [wf_results[w]['sharpe'] for w in wf_results]
     colors = ['green' if r > 0 else 'red' for r in wf_rets]
@@ -1592,7 +1695,7 @@ if ablation_results:
     abl_sortinos = [ablation_results[l]['sortino'] for l in lam_vals]
     ax.plot(lam_vals, abl_sharpes, 'o-', color='steelblue', label='Sharpe', linewidth=2)
     ax.plot(lam_vals, abl_sortinos, 's-', color='coral', label='Sortino', linewidth=2)
-    ax.set_xlabel('λ (Semantic Penalty)')
+    ax.set_xlabel('lambda (Semantic Penalty)')
     ax.set_ylabel('Ratio')
     ax.set_title('Lambda Ablation (Staged Training)')
     ax.legend()
@@ -1634,9 +1737,9 @@ plt.savefig('drawdown_comparison.png', dpi=150, bbox_inches='tight')
 print("  Saved: drawdown_comparison.png")
 
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # SAVE ALL RESULTS
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 def to_serializable(obj):
     if isinstance(obj, (np.floating, np.float64, np.float32)):
         return float(obj)
@@ -1690,6 +1793,18 @@ all_results = {
             'sortino': float(compute_sortino(mvo_returns_trim)),
             'max_drawdown': float(compute_max_drawdown(mvo_returns_trim)),
         },
+        'risk_parity': {
+            'cumulative_return': float(compute_cumulative_return(rp_returns_trim)),
+            'sharpe': float(compute_sharpe(rp_returns_trim)),
+            'sortino': float(compute_sortino(rp_returns_trim)),
+            'max_drawdown': float(compute_max_drawdown(rp_returns_trim)),
+        },
+        'momentum': {
+            'cumulative_return': float(compute_cumulative_return(mom_returns_trim)),
+            'sharpe': float(compute_sharpe(mom_returns_trim)),
+            'sortino': float(compute_sortino(mom_returns_trim)),
+            'max_drawdown': float(compute_max_drawdown(mom_returns_trim)),
+        },
     },
     'holdout_test': {
         'test_period': f"{test_prices.index[0].date()} to {test_prices.index[-1].date()}",
@@ -1707,6 +1822,18 @@ all_results = {
             'cumulative_return': float(compute_cumulative_return(holdout_ew_rets[:holdout_min_len])),
             'sharpe': float(compute_sharpe(holdout_ew_rets[:holdout_min_len])),
         },
+        'mvo': {
+            'cumulative_return': float(compute_cumulative_return(holdout_mvo_rets[:holdout_min_len])),
+            'sharpe': float(compute_sharpe(holdout_mvo_rets[:holdout_min_len])),
+        },
+        'risk_parity': {
+            'cumulative_return': float(compute_cumulative_return(holdout_rp_rets[:holdout_min_len])),
+            'sharpe': float(compute_sharpe(holdout_rp_rets[:holdout_min_len])),
+        },
+        'momentum': {
+            'cumulative_return': float(compute_cumulative_return(holdout_mom_rets[:holdout_min_len])),
+            'sharpe': float(compute_sharpe(holdout_mom_rets[:holdout_min_len])),
+        },
     },
 }
 
@@ -1716,5 +1843,5 @@ with open("data/processed/staged_training_results.json", "w") as f:
 print(f"\nResults saved to data/processed/staged_training_results.json")
 print(f"\nTotal runtime: {time.time()-t0:.1f}s")
 print("\n" + "=" * 70)
-print("  DONE — Staged MARL Training Complete")
+print("  DONE - Staged MARL Training Complete")
 print("=" * 70)
