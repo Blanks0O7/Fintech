@@ -48,6 +48,16 @@ warnings.filterwarnings('ignore')
 SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+WORKER_WINDOW_SIZE = 30
+WORKER_LAMBDA_PENALTY = 0.35
+WORKER_GAMMA_PENALTY = 0.01
+MANAGER_FAST_WINDOW = 5
+MANAGER_SLOW_WINDOW = 20
 
 # ==============================================================
 # DATA LOADING
@@ -55,6 +65,7 @@ torch.manual_seed(SEED)
 print("=" * 70)
 print("STAGED MARL TRAINING - Curriculum Learning")
 print("=" * 70)
+print(f"PyTorch device: {DEVICE}")
 
 price_df = pd.read_csv("data/sp500_100_prices.csv", index_col=0, parse_dates=True)
 lexical_df = pd.read_csv("data/processed/lexical_matrix_100.csv", index_col=0)
@@ -102,7 +113,9 @@ class WorkerEnv(gym.Env):
     TURNOVER_LIMIT = 0.5
 
     def __init__(self, price_df, lexical_matrix, tickers, profile="neutral",
-                 window_size=30, lambda_penalty=0.1, gamma_penalty=0.01):
+                 window_size=WORKER_WINDOW_SIZE,
+                 lambda_penalty=WORKER_LAMBDA_PENALTY,
+                 gamma_penalty=WORKER_GAMMA_PENALTY):
         super().__init__()
         self.profile = profile
         self.tickers = [t for t in tickers if t in price_df.columns and t in lexical_matrix.index]
@@ -178,10 +191,14 @@ class WorkerEnv(gym.Env):
                 port_vol = np.sqrt(max(np.dot(w_norm.T, np.dot(self.cov_matrix, w_norm)), 1e-10))
             else:
                 port_vol = 0.0
-            reward = float(log_ret - self.lambda_penalty * sem_pen - 2.0 * port_vol)
+            reward = float(log_ret - self.lambda_penalty * sem_pen - 2.0 * port_vol - self.gamma_penalty * turnover)
         elif self.profile == "risky":
-            # Asymmetric reward: amplify gains, dampen losses to avoid crash amplification
-            reward = float(1.5 * max(log_ret, 0) + 0.5 * min(log_ret, 0) - 0.5 * self.lambda_penalty * sem_pen)
+            reward = float(
+                1.2 * max(log_ret, 0)
+                + 1.5 * min(log_ret, 0)
+                - self.lambda_penalty * sem_pen
+                - self.gamma_penalty * turnover
+            )
         else:
             reward = float(log_ret - self.lambda_penalty * sem_pen - self.gamma_penalty * turnover)
 
@@ -215,11 +232,22 @@ class ManagerEnv(gym.Env):
     """Manager agent: allocates capital across 3 risk-profile Workers."""
     metadata = {"render_modes": []}
 
-    def __init__(self, price_df, lexical_matrix, risk_pools, window_size=30):
+    def __init__(self, price_df, lexical_matrix, risk_pools,
+                 window_size=WORKER_WINDOW_SIZE,
+                 fast_window=MANAGER_FAST_WINDOW,
+                 slow_window=MANAGER_SLOW_WINDOW,
+                 turnover_penalty=0.01,
+                 stress_penalty=0.20,
+                 drawdown_penalty=0.30):
         super().__init__()
         self.risk_pools = risk_pools
         self.pool_names = ['Safe', 'Neutral', 'Risky']
         self.n_pools = 3
+        self.fast_window = fast_window
+        self.slow_window = max(slow_window, fast_window + 1)
+        self.turnover_penalty = turnover_penalty
+        self.stress_penalty = stress_penalty
+        self.drawdown_penalty = drawdown_penalty
 
         self.pool_prices = {}
         for name in self.pool_names:
@@ -231,6 +259,8 @@ class ManagerEnv(gym.Env):
 
         self.window_size = window_size
         self.all_prices = np.column_stack([self.pool_prices[p] for p in self.pool_names])
+        self.market_proxy = price_df.mean(axis=1).values
+        self.market_returns = np.diff(self.market_proxy) / (self.market_proxy[:-1] + 1e-8)
 
         self.pool_sim = np.zeros(self.n_pools)
         for i, name in enumerate(self.pool_names):
@@ -240,7 +270,9 @@ class ManagerEnv(gym.Env):
                 mask = np.triu(np.ones_like(sim, dtype=bool), k=1)
                 self.pool_sim[i] = np.nanmean(sim[mask])
 
-        obs_dim = window_size * self.n_pools + self.n_pools + self.n_pools + self.n_pools
+        self.market_feature_dim = 7
+        self.extra_context_dim = self.n_pools + self.n_pools + self.market_feature_dim
+        obs_dim = window_size * self.n_pools + self.n_pools + self.extra_context_dim
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.n_pools,), dtype=np.float32)
 
@@ -280,13 +312,57 @@ class ManagerEnv(gym.Env):
 
         log_ret = np.log(global_ret)
         turnover = np.sum(np.abs(v - self.pool_weights))
-        reward = float(log_ret - 0.01 * turnover)
+        market_context = self._get_market_context()
+        current_drawdown = float(market_context[-2])
+        stress_score = float(market_context[-1])
+        neutral_idx = self.pool_names.index('Neutral')
+        risky_idx = self.pool_names.index('Risky')
+
+        stress_exposure = 0.35 * v[risky_idx] + 0.15 * v[neutral_idx]
+        drawdown_exposure = max(current_drawdown - 0.08, 0.0) * (0.50 * v[risky_idx] + 0.25 * v[neutral_idx])
+        reward = float(
+            log_ret
+            - self.turnover_penalty * turnover
+            - self.stress_penalty * stress_score * stress_exposure
+            - self.drawdown_penalty * drawdown_exposure
+        )
 
         self.pool_weights = v
         self.current_step += 1
         terminated = self.current_step >= self.max_steps
         return self._get_obs(), reward, terminated, False, {
-            'pool_weights': v.copy(), 'global_return': global_ret}
+            'pool_weights': v.copy(), 'global_return': global_ret,
+            'stress_score': stress_score, 'current_drawdown': current_drawdown}
+
+    def _get_market_context(self):
+        recent_prices = self.market_proxy[max(0, self.current_step - self.slow_window):self.current_step + 1]
+        short_prices = self.market_proxy[max(0, self.current_step - self.fast_window):self.current_step + 1]
+        recent_returns = self.market_returns[max(0, self.current_step - self.slow_window):self.current_step]
+        short_returns = self.market_returns[max(0, self.current_step - self.fast_window):self.current_step]
+
+        short_return = float(short_prices[-1] / (short_prices[0] + 1e-8) - 1.0) if len(short_prices) > 1 else 0.0
+        slow_return = float(recent_prices[-1] / (recent_prices[0] + 1e-8) - 1.0) if len(recent_prices) > 1 else 0.0
+        short_vol = float(np.std(short_returns) * np.sqrt(252)) if len(short_returns) > 1 else 0.0
+        slow_vol = float(np.std(recent_returns) * np.sqrt(252)) if len(recent_returns) > 1 else 0.0
+        downside_ratio = float(np.mean(recent_returns < 0.0)) if len(recent_returns) > 0 else 0.0
+        rolling_peak = float(np.max(recent_prices)) if len(recent_prices) > 0 else 1.0
+        current_drawdown = float((rolling_peak - recent_prices[-1]) / (rolling_peak + 1e-8)) if len(recent_prices) > 0 else 0.0
+        stress_score = np.clip(
+            (short_vol / (slow_vol + 1e-8) - 1.0)
+            + 2.0 * current_drawdown
+            + downside_ratio,
+            0.0,
+            3.0,
+        )
+        return np.array([
+            short_return,
+            slow_return,
+            short_vol,
+            slow_vol,
+            downside_ratio,
+            current_drawdown,
+            stress_score,
+        ], dtype=np.float32)
 
     def _get_obs(self):
         s = self.current_step - self.window_size
@@ -294,7 +370,8 @@ class ManagerEnv(gym.Env):
         norm = win / (win[0, :] + 1e-8)
         return np.concatenate([
             norm.flatten(), self.pool_weights,
-            self.worker_cum_returns, self.worker_volatilities
+            self.worker_cum_returns, self.worker_volatilities,
+            self._get_market_context()
         ]).astype(np.float32)
 
 
@@ -303,19 +380,20 @@ class ManagerEnv(gym.Env):
 # ==============================================================
 class EIIENetwork(nn.Module):
     """EIIE with shared Conv1D weights, LayerNorm, Dropout + Dirichlet output."""
-    def __init__(self, n_assets, window_size, n_price_assets=None):
+    def __init__(self, n_assets, window_size, n_price_assets=None, extra_context_dim=0):
         super().__init__()
         self.n_assets = n_assets
         self.n_price_assets = n_price_assets or n_assets
+        self.extra_context_dim = extra_context_dim
         self.conv1 = nn.Conv1d(1, 16, 3, padding=1)
         self.conv2 = nn.Conv1d(16, 32, 3, padding=1)
-        fc_in = self.n_price_assets * 32 + n_assets
+        fc_in = self.n_price_assets * 32 + n_assets + extra_context_dim
         self.fc1 = nn.Linear(fc_in, 64)
         self.ln1 = nn.LayerNorm(64)
         self.dropout = nn.Dropout(0.1)
         self.fc2 = nn.Linear(64, n_assets)
 
-    def forward(self, pw, pvm):
+    def forward(self, pw, pvm, extra_context=None):
         feats = []
         for i in range(self.n_price_assets):
             x = pw[:, i, :].unsqueeze(1)
@@ -323,7 +401,12 @@ class EIIENetwork(nn.Module):
             x = F.relu(self.conv2(x))
             x = x.mean(dim=2)
             feats.append(x)
-        c = torch.cat(feats + [pvm], dim=1)
+        inputs = feats + [pvm]
+        if self.extra_context_dim:
+            if extra_context is None:
+                raise ValueError("extra_context is required when extra_context_dim > 0")
+            inputs.append(extra_context)
+        c = torch.cat(inputs, dim=1)
         x = self.dropout(F.relu(self.ln1(self.fc1(c))))
         return F.softplus(self.fc2(x)) + 1.0
 
@@ -372,6 +455,34 @@ def compute_sharpe(returns):
     if len(returns) < 2 or np.std(returns) < 1e-10:
         return 0.0
     return float(np.mean(returns) / np.std(returns) * np.sqrt(252))
+
+
+def make_worker_envs(price_source, lexical_matrix, risk_pools):
+    worker_envs = {}
+    for profile in ['Safe', 'Neutral', 'Risky']:
+        pool_tickers = [t for t in risk_pools[profile] if t in price_source.columns]
+        if len(pool_tickers) >= 2:
+            worker_envs[profile] = WorkerEnv(
+                price_source,
+                lexical_matrix,
+                pool_tickers,
+                profile=profile.lower(),
+                window_size=WORKER_WINDOW_SIZE,
+                lambda_penalty=WORKER_LAMBDA_PENALTY,
+                gamma_penalty=WORKER_GAMMA_PENALTY,
+            )
+    return worker_envs
+
+
+def make_manager_env(price_source, lexical_matrix, risk_pools):
+    return ManagerEnv(
+        price_source,
+        lexical_matrix,
+        risk_pools,
+        window_size=WORKER_WINDOW_SIZE,
+        fast_window=MANAGER_FAST_WINDOW,
+        slow_window=MANAGER_SLOW_WINDOW,
+    )
 
 def dirichlet_mode(alpha):
     K = len(alpha)
@@ -438,6 +549,10 @@ def five_metric_table(returns, weights_history=None, lexical_matrix=None, label=
 # EMA baselines: per-agent running average of episode returns for variance reduction
 _ema_baselines = {}
 
+
+def tensor_from_numpy(array_like, device=DEVICE):
+    return torch.as_tensor(array_like, dtype=torch.float32, device=device)
+
 def reinforce_update(log_probs, rewards, entropies, optimizer, net, entropy_bonus, gamma=0.99):
     """REINFORCE with EMA baseline and entropy bonus (lower variance than episode-mean)."""
     if not log_probs:
@@ -446,7 +561,7 @@ def reinforce_update(log_probs, rewards, entropies, optimizer, net, entropy_bonu
     for r in reversed(rewards):
         G = r + gamma * G
         rets.insert(0, G)
-    rets = torch.FloatTensor(rets)
+    rets = torch.tensor(rets, dtype=torch.float32, device=DEVICE)
 
     # EMA baseline: use per-network running average instead of episode mean
     net_id = id(net)
@@ -492,13 +607,13 @@ def train_staged(manager_env, worker_envs,
     # Initialize all networks
     m_n = manager_env.action_space.shape[0]
     m_ws = manager_env.window_size
-    manager_net = EIIENetwork(m_n, m_ws)
+    manager_net = EIIENetwork(m_n, m_ws, extra_context_dim=manager_env.extra_context_dim).to(DEVICE)
     
     worker_nets, worker_opts, worker_schedulers = {}, {}, {}
     for name in pool_names:
         if name in worker_envs:
             env = worker_envs[name]
-            worker_nets[name] = EIIENetwork(env.n_total, env.window_size, n_price_assets=env.n_assets)
+            worker_nets[name] = EIIENetwork(env.n_total, env.window_size, n_price_assets=env.n_assets).to(DEVICE)
 
     hist = {'phase': [], 'manager_rewards': [], 'worker_rewards': {n: [] for n in pool_names},
             'global_returns': [], 'allocations': [], 'phase_boundaries': []}
@@ -552,8 +667,8 @@ def train_staged(manager_env, worker_envs,
                 net = worker_nets[name]
                 obs = w_obs[name]
                 w_obs_dim = env.window_size * env.n_assets
-                w_pw = torch.FloatTensor(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
-                w_pvm = torch.FloatTensor(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
+                w_pw = tensor_from_numpy(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
+                w_pvm = tensor_from_numpy(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
                 w_alpha = net(w_pw, w_pvm).squeeze()
                 w_alpha = torch.clamp(w_alpha, min=1.01, max=100.0)
                 w_dist = torch.distributions.Dirichlet(w_alpha)
@@ -561,7 +676,7 @@ def train_staged(manager_env, worker_envs,
                 w_lps[name].append(w_dist.log_prob(w_action))
                 w_entropies[name].append(w_dist.entropy())
 
-                obs_new, w_reward, w_term, _, w_info = env.step(w_action.detach().numpy())
+                obs_new, w_reward, w_term, _, w_info = env.step(w_action.detach().cpu().numpy())
                 w_obs[name] = obs_new
                 w_rews[name].append(w_reward)
                 worker_returns[name] = w_info.get('portfolio_return', 1.0)
@@ -641,9 +756,10 @@ def train_staged(manager_env, worker_envs,
 
             # Manager samples action
             obs_dim = m_ws * m_n
-            m_pw = torch.FloatTensor(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
-            m_pvm = torch.FloatTensor(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
-            m_alpha = manager_net(m_pw, m_pvm).squeeze()
+            m_pw = tensor_from_numpy(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
+            m_pvm = tensor_from_numpy(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
+            m_context = tensor_from_numpy(m_obs[obs_dim+m_n:]).unsqueeze(0)
+            m_alpha = manager_net(m_pw, m_pvm, m_context).squeeze()
             m_alpha = torch.clamp(m_alpha, min=1.01, max=100.0)
             m_dist = torch.distributions.Dirichlet(m_alpha)
             m_action = m_dist.sample()
@@ -659,10 +775,10 @@ def train_staged(manager_env, worker_envs,
                 net = worker_nets[name]
                 obs = w_obs[name]
                 w_obs_dim = env.window_size * env.n_assets
-                w_pw = torch.FloatTensor(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
-                w_pvm = torch.FloatTensor(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
+                w_pw = tensor_from_numpy(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
+                w_pvm = tensor_from_numpy(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
                 with torch.no_grad():
-                    w_alpha = net(w_pw, w_pvm).squeeze().numpy()
+                    w_alpha = net(w_pw, w_pvm).squeeze().detach().cpu().numpy()
                     w_w = dirichlet_mode(w_alpha)
 
                 obs_new, _, w_term, _, w_info = env.step(w_w)
@@ -673,7 +789,7 @@ def train_staged(manager_env, worker_envs,
                     done = True
 
             m_obs_new, m_reward, m_term, _, m_info = manager_env.step(
-                m_action.detach().numpy(), worker_returns=worker_returns)
+                m_action.detach().cpu().numpy(), worker_returns=worker_returns)
             m_obs = m_obs_new
             m_rews.append(m_reward)
             if m_term:
@@ -753,9 +869,10 @@ def train_staged(manager_env, worker_envs,
             m_obs = manager_env._get_obs()
 
             obs_dim = m_ws * m_n
-            m_pw = torch.FloatTensor(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
-            m_pvm = torch.FloatTensor(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
-            m_alpha = manager_net(m_pw, m_pvm).squeeze()
+            m_pw = tensor_from_numpy(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
+            m_pvm = tensor_from_numpy(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
+            m_context = tensor_from_numpy(m_obs[obs_dim+m_n:]).unsqueeze(0)
+            m_alpha = manager_net(m_pw, m_pvm, m_context).squeeze()
             m_alpha = torch.clamp(m_alpha, min=1.01, max=100.0)
             m_dist = torch.distributions.Dirichlet(m_alpha)
             m_action = m_dist.sample()
@@ -770,8 +887,8 @@ def train_staged(manager_env, worker_envs,
                 net = worker_nets[name]
                 obs = w_obs[name]
                 w_obs_dim = env.window_size * env.n_assets
-                w_pw = torch.FloatTensor(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
-                w_pvm = torch.FloatTensor(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
+                w_pw = tensor_from_numpy(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
+                w_pvm = tensor_from_numpy(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
                 w_alpha = net(w_pw, w_pvm).squeeze()
                 w_alpha = torch.clamp(w_alpha, min=1.01, max=100.0)
                 w_dist = torch.distributions.Dirichlet(w_alpha)
@@ -779,7 +896,7 @@ def train_staged(manager_env, worker_envs,
                 w_lps[name].append(w_dist.log_prob(w_action))
                 w_entropies[name].append(w_dist.entropy())
 
-                obs_new, w_reward, w_term, _, w_info = env.step(w_action.detach().numpy())
+                obs_new, w_reward, w_term, _, w_info = env.step(w_action.detach().cpu().numpy())
                 w_obs[name] = obs_new
                 w_rews[name].append(w_reward)
                 worker_returns[name] = w_info.get('portfolio_return', 1.0)
@@ -787,7 +904,7 @@ def train_staged(manager_env, worker_envs,
                     done = True
 
             m_obs_new, m_reward, m_term, _, m_info = manager_env.step(
-                m_action.detach().numpy(), worker_returns=worker_returns)
+                m_action.detach().cpu().numpy(), worker_returns=worker_returns)
             m_obs = m_obs_new
             m_rews.append(m_reward)
             if m_term:
@@ -832,7 +949,7 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
     pool_names = ['Safe', 'Neutral', 'Risky']
     m_n = manager_env.action_space.shape[0]
     m_ws = manager_env.window_size
-    manager_net = EIIENetwork(m_n, m_ws)
+    manager_net = EIIENetwork(m_n, m_ws, extra_context_dim=manager_env.extra_context_dim).to(DEVICE)
     manager_opt = optim.Adam(manager_net.parameters(), lr=lr)
     m_scheduler = optim.lr_scheduler.CosineAnnealingLR(manager_opt, T_max=n_episodes, eta_min=5e-4)
 
@@ -840,7 +957,7 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
     for name in pool_names:
         if name in worker_envs:
             env = worker_envs[name]
-            worker_nets[name] = EIIENetwork(env.n_total, env.window_size, n_price_assets=env.n_assets)
+            worker_nets[name] = EIIENetwork(env.n_total, env.window_size, n_price_assets=env.n_assets).to(DEVICE)
             worker_opts[name] = optim.Adam(worker_nets[name].parameters(), lr=lr)
             worker_schedulers[name] = optim.lr_scheduler.CosineAnnealingLR(
                 worker_opts[name], T_max=n_episodes, eta_min=5e-4)
@@ -877,9 +994,10 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
             m_obs = manager_env._get_obs()
 
             obs_dim = m_ws * m_n
-            m_pw = torch.FloatTensor(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
-            m_pvm = torch.FloatTensor(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
-            m_alpha = manager_net(m_pw, m_pvm).squeeze()
+            m_pw = tensor_from_numpy(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
+            m_pvm = tensor_from_numpy(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
+            m_context = tensor_from_numpy(m_obs[obs_dim+m_n:]).unsqueeze(0)
+            m_alpha = manager_net(m_pw, m_pvm, m_context).squeeze()
             m_alpha = torch.clamp(m_alpha, min=1.01, max=100.0)
             m_dist = torch.distributions.Dirichlet(m_alpha)
             m_action = m_dist.sample()
@@ -894,8 +1012,8 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
                 net = worker_nets[name]
                 obs = w_obs[name]
                 w_obs_dim = env.window_size * env.n_assets
-                w_pw = torch.FloatTensor(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
-                w_pvm = torch.FloatTensor(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
+                w_pw = tensor_from_numpy(obs[:w_obs_dim].reshape(env.n_assets, env.window_size)).unsqueeze(0)
+                w_pvm = tensor_from_numpy(obs[w_obs_dim:w_obs_dim+env.n_total]).unsqueeze(0)
                 w_alpha = net(w_pw, w_pvm).squeeze()
                 w_alpha = torch.clamp(w_alpha, min=1.01, max=100.0)
                 w_dist = torch.distributions.Dirichlet(w_alpha)
@@ -903,7 +1021,7 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
                 w_lps[name].append(w_dist.log_prob(w_action))
                 w_entropies[name].append(w_dist.entropy())
 
-                obs_new, w_reward, w_term, _, w_info = env.step(w_action.detach().numpy())
+                obs_new, w_reward, w_term, _, w_info = env.step(w_action.detach().cpu().numpy())
                 w_obs[name] = obs_new
                 w_rews[name].append(w_reward)
                 worker_returns[name] = w_info.get('portfolio_return', 1.0)
@@ -911,7 +1029,7 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
                     done = True
 
             m_obs_new, m_reward, m_term, _, m_info = manager_env.step(
-                m_action.detach().numpy(), worker_returns=worker_returns)
+                m_action.detach().cpu().numpy(), worker_returns=worker_returns)
             m_obs = m_obs_new
             m_rews.append(m_reward)
             if m_term:
@@ -968,10 +1086,11 @@ def evaluate_system(manager_env, worker_envs, manager_net, worker_nets, max_step
         m_obs = manager_env._get_obs()
 
         obs_dim = m_ws * m_n
-        m_pw = torch.FloatTensor(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
-        m_pvm = torch.FloatTensor(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
+        m_pw = tensor_from_numpy(m_obs[:obs_dim].reshape(m_n, m_ws)).unsqueeze(0)
+        m_pvm = tensor_from_numpy(m_obs[obs_dim:obs_dim+m_n]).unsqueeze(0)
+        m_context = tensor_from_numpy(m_obs[obs_dim+m_n:]).unsqueeze(0)
         with torch.no_grad():
-            m_alpha = manager_net(m_pw, m_pvm).squeeze().numpy()
+            m_alpha = manager_net(m_pw, m_pvm, m_context).squeeze().detach().cpu().numpy()
             v = dirichlet_mode(m_alpha)
 
         w_rets = {}
@@ -982,10 +1101,10 @@ def evaluate_system(manager_env, worker_envs, manager_net, worker_nets, max_step
             net = worker_nets[name]
             obs = w_obs[name]
             w_od = env.window_size * env.n_assets
-            w_pw = torch.FloatTensor(obs[:w_od].reshape(env.n_assets, env.window_size)).unsqueeze(0)
-            w_pvm = torch.FloatTensor(obs[w_od:w_od+env.n_total]).unsqueeze(0)
+            w_pw = tensor_from_numpy(obs[:w_od].reshape(env.n_assets, env.window_size)).unsqueeze(0)
+            w_pvm = tensor_from_numpy(obs[w_od:w_od+env.n_total]).unsqueeze(0)
             with torch.no_grad():
-                w_alpha = net(w_pw, w_pvm).squeeze().numpy()
+                w_alpha = net(w_pw, w_pvm).squeeze().detach().cpu().numpy()
                 w_w = dirichlet_mode(w_alpha)
             obs_new, _, w_term, _, w_info = env.step(w_w)
             w_obs[name] = obs_new
@@ -1175,17 +1294,11 @@ def momentum_baseline(price_df, tickers, window_size=30, lookback=60, top_pct=0.
 t0 = time.time()
 
 # Create environments
-worker_envs = {}
-for profile in ['Safe', 'Neutral', 'Risky']:
-    pool_tickers = risk_pools[profile]
-    if len(pool_tickers) >= 2:
-        worker_envs[profile] = WorkerEnv(
-            price_df, lexical_df, pool_tickers,
-            profile=profile.lower(), window_size=30,
-            lambda_penalty=0.1, gamma_penalty=0.01)
-        print(f"  {profile} Worker: {len(pool_tickers)} stocks")
+worker_envs = make_worker_envs(price_df, lexical_df, risk_pools)
+for profile, env in worker_envs.items():
+    print(f"  {profile} Worker: {env.n_assets} stocks")
 
-manager_env = ManagerEnv(price_df, lexical_df, risk_pools, window_size=30)
+manager_env = make_manager_env(price_df, lexical_df, risk_pools)
 print(f"  Manager: allocating across {len(worker_envs)} risk pools\n")
 
 # ---------------------------------------------------------
@@ -1215,16 +1328,8 @@ print("  EXPERIMENT B: CONCURRENT TRAINING (baseline)")
 print("#" * 70)
 
 # Recreate fresh environments for fair comparison
-worker_envs_c = {}
-for profile in ['Safe', 'Neutral', 'Risky']:
-    pool_tickers = risk_pools[profile]
-    if len(pool_tickers) >= 2:
-        worker_envs_c[profile] = WorkerEnv(
-            price_df, lexical_df, pool_tickers,
-            profile=profile.lower(), window_size=30,
-            lambda_penalty=0.1, gamma_penalty=0.01)
-
-manager_env_c = ManagerEnv(price_df, lexical_df, risk_pools, window_size=30)
+worker_envs_c = make_worker_envs(price_df, lexical_df, risk_pools)
+manager_env_c = make_manager_env(price_df, lexical_df, risk_pools)
 
 t1 = time.time()
 conc_mgr_net, conc_w_nets, conc_hist = train_concurrent(
@@ -1232,15 +1337,8 @@ conc_mgr_net, conc_w_nets, conc_hist = train_concurrent(
 )
 
 # Recreate envs for eval
-worker_envs_ce = {}
-for profile in ['Safe', 'Neutral', 'Risky']:
-    pool_tickers = risk_pools[profile]
-    if len(pool_tickers) >= 2:
-        worker_envs_ce[profile] = WorkerEnv(
-            price_df, lexical_df, pool_tickers,
-            profile=profile.lower(), window_size=30,
-            lambda_penalty=0.1, gamma_penalty=0.01)
-manager_env_ce = ManagerEnv(price_df, lexical_df, risk_pools, window_size=30)
+worker_envs_ce = make_worker_envs(price_df, lexical_df, risk_pools)
+manager_env_ce = make_manager_env(price_df, lexical_df, risk_pools)
 
 conc_eval = evaluate_system(manager_env_ce, worker_envs_ce, conc_mgr_net, conc_w_nets, max_steps=200)
 print(f"\nConcurrent Training Time: {time.time()-t1:.1f}s")
@@ -1257,29 +1355,13 @@ test_prices = price_df.iloc[split_idx:]
 print(f"  Test period: {test_prices.index[0].date()} -> {test_prices.index[-1].date()} ({len(test_prices)} days)")
 
 # Staged on holdout
-holdout_worker_envs = {}
-for profile in ['Safe', 'Neutral', 'Risky']:
-    pool_tickers = risk_pools[profile]
-    valid_t = [t for t in pool_tickers if t in test_prices.columns]
-    if len(valid_t) >= 2:
-        holdout_worker_envs[profile] = WorkerEnv(
-            test_prices, lexical_df, valid_t,
-            profile=profile.lower(), window_size=30,
-            lambda_penalty=0.1, gamma_penalty=0.01)
-holdout_mgr_env = ManagerEnv(test_prices, lexical_df, risk_pools, window_size=30)
+holdout_worker_envs = make_worker_envs(test_prices, lexical_df, risk_pools)
+holdout_mgr_env = make_manager_env(test_prices, lexical_df, risk_pools)
 holdout_staged_eval = evaluate_system(holdout_mgr_env, holdout_worker_envs, staged_mgr_net, staged_w_nets, max_steps=200)
 
 # Concurrent on holdout
-holdout_worker_envs_c = {}
-for profile in ['Safe', 'Neutral', 'Risky']:
-    pool_tickers = risk_pools[profile]
-    valid_t = [t for t in pool_tickers if t in test_prices.columns]
-    if len(valid_t) >= 2:
-        holdout_worker_envs_c[profile] = WorkerEnv(
-            test_prices, lexical_df, valid_t,
-            profile=profile.lower(), window_size=30,
-            lambda_penalty=0.1, gamma_penalty=0.01)
-holdout_mgr_env_c = ManagerEnv(test_prices, lexical_df, risk_pools, window_size=30)
+holdout_worker_envs_c = make_worker_envs(test_prices, lexical_df, risk_pools)
+holdout_mgr_env_c = make_manager_env(test_prices, lexical_df, risk_pools)
 holdout_conc_eval = evaluate_system(holdout_mgr_env_c, holdout_worker_envs_c, conc_mgr_net, conc_w_nets, max_steps=200)
 
 # EW/MVO on holdout
@@ -1484,17 +1566,8 @@ for wf_name, train_s, train_e, test_s, test_e in wf_windows:
         print(f"  Skipping - insufficient data")
         continue
 
-    wf_worker_envs = {}
-    for profile in ['Safe', 'Neutral', 'Risky']:
-        pool_tickers = risk_pools[profile]
-        valid_t = [t for t in pool_tickers if t in train_prices.columns]
-        if len(valid_t) >= 2:
-            wf_worker_envs[profile] = WorkerEnv(
-                train_prices, lexical_df, valid_t,
-                profile=profile.lower(), window_size=30,
-                lambda_penalty=0.1, gamma_penalty=0.01)
-
-    wf_mgr_env = ManagerEnv(train_prices, lexical_df, risk_pools, window_size=30)
+    wf_worker_envs = make_worker_envs(train_prices, lexical_df, risk_pools)
+    wf_mgr_env = make_manager_env(train_prices, lexical_df, risk_pools)
 
     # Staged training for walk-forward (reduced episodes for speed)
     wf_mgr_net, wf_w_nets, _ = train_staged(
@@ -1504,17 +1577,8 @@ for wf_name, train_s, train_e, test_s, test_e in wf_windows:
     )
 
     # Test
-    test_worker_envs = {}
-    for profile in ['Safe', 'Neutral', 'Risky']:
-        pool_tickers = risk_pools[profile]
-        valid_t = [t for t in pool_tickers if t in test_prices.columns]
-        if len(valid_t) >= 2:
-            test_worker_envs[profile] = WorkerEnv(
-                test_prices, lexical_df, valid_t,
-                profile=profile.lower(), window_size=30,
-                lambda_penalty=0.1, gamma_penalty=0.01)
-
-    test_mgr_env = ManagerEnv(test_prices, lexical_df, risk_pools, window_size=30)
+    test_worker_envs = make_worker_envs(test_prices, lexical_df, risk_pools)
+    test_mgr_env = make_manager_env(test_prices, lexical_df, risk_pools)
     wf_eval = evaluate_system(test_mgr_env, test_worker_envs, wf_mgr_net, wf_w_nets, max_steps=200)
 
     wf_results[wf_name] = wf_eval
@@ -1551,10 +1615,10 @@ for lam in lambdas:
         if len(pool_tickers) >= 2:
             abl_worker_envs[profile] = WorkerEnv(
                 price_df, lexical_df, pool_tickers,
-                profile=profile.lower(), window_size=30,
-                lambda_penalty=lam, gamma_penalty=0.01)
+                profile=profile.lower(), window_size=WORKER_WINDOW_SIZE,
+                lambda_penalty=lam, gamma_penalty=WORKER_GAMMA_PENALTY)
 
-    abl_mgr_env = ManagerEnv(price_df, lexical_df, risk_pools, window_size=30)
+    abl_mgr_env = make_manager_env(price_df, lexical_df, risk_pools)
     abl_mgr_net, abl_w_nets, _ = train_staged(
         abl_mgr_env, abl_worker_envs,
         phase1_episodes=120, phase2_episodes=80, phase3_episodes=40,
@@ -1568,9 +1632,9 @@ for lam in lambdas:
         if len(pool_tickers) >= 2:
             abl_worker_envs_e[profile] = WorkerEnv(
                 price_df, lexical_df, pool_tickers,
-                profile=profile.lower(), window_size=30,
-                lambda_penalty=lam, gamma_penalty=0.01)
-    abl_mgr_env_e = ManagerEnv(price_df, lexical_df, risk_pools, window_size=30)
+                profile=profile.lower(), window_size=WORKER_WINDOW_SIZE,
+                lambda_penalty=lam, gamma_penalty=WORKER_GAMMA_PENALTY)
+    abl_mgr_env_e = make_manager_env(price_df, lexical_df, risk_pools)
 
     abl_eval = evaluate_system(abl_mgr_env_e, abl_worker_envs_e, abl_mgr_net, abl_w_nets, max_steps=200)
     ablation_results[lam] = abl_eval

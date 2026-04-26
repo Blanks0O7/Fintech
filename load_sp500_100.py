@@ -35,15 +35,32 @@ EDGAR_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
+SP500_FALLBACK_CSV = (
+    "https://raw.githubusercontent.com/datasets/"
+    "s-and-p-500-companies/master/data/constituents.csv"
+)
+
 
 def get_sp500_tickers():
-    """Scrape current S&P 500 tickers from Wikipedia."""
-    print("Scraping S&P 500 tickers from Wikipedia...")
+    """Load S&P 500 tickers, falling back to a static CSV when Wikipedia blocks requests."""
+    print("Loading S&P 500 tickers...")
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(url, headers=headers)
-    tables = pd.read_html(StringIO(resp.text))
-    df = tables[0]
+
+    df = None
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        tables = pd.read_html(StringIO(resp.text))
+        df = tables[0]
+        print("  Source: Wikipedia")
+    except Exception as exc:
+        print(f"  Wikipedia unavailable ({exc}); falling back to static CSV...")
+        fallback_resp = requests.get(SP500_FALLBACK_CSV, headers=headers, timeout=20)
+        fallback_resp.raise_for_status()
+        df = pd.read_csv(StringIO(fallback_resp.text))
+        print("  Source: GitHub raw CSV fallback")
+
     tickers = df["Symbol"].tolist()
     tickers = [t.replace(".", "-") for t in tickers]
     sectors = dict(zip(
@@ -178,44 +195,41 @@ def get_10k_text_edgar_v2(ticker, max_retries=2):
 def get_business_descriptions(tickers):
     """
     Get business descriptions for all tickers.
-    Strategy: Try SEC EDGAR 10-K first, fall back to Yahoo Finance.
+    Strategy: use Yahoo Finance summaries first, then SEC EDGAR only for missing names.
     """
     print(f"\nFetching business descriptions for {len(tickers)} tickers...")
     descriptions = {}
     sources = {}
-    
-    # First pass: Try EDGAR 10-K
-    print("  Pass 1: Trying SEC EDGAR 10-K filings...")
+
+    print("  Pass 1: Yahoo Finance summaries...")
     for i, ticker in enumerate(tickers):
         print(f"    [{i+1}/{len(tickers)}] {ticker}...", end=" ")
-        
-        text = get_10k_text_edgar_v2(ticker)
-        if text:
-            descriptions[ticker] = text
-            sources[ticker] = "10-K"
-            print(f"10-K ({len(text.split())} words)")
-        else:
-            print("no 10-K found")
-        
-        time.sleep(0.15)  # SEC rate limit
-    
-    # Second pass: Yahoo Finance fallback
+        try:
+            info = yf.Ticker(ticker).info
+            summary = info.get("longBusinessSummary", "")
+            if summary and len(summary) > 50:
+                descriptions[ticker] = summary
+                sources[ticker] = "Yahoo"
+                print(f"Yahoo ({len(summary.split())} words)")
+            else:
+                print("no Yahoo summary")
+        except Exception as e:
+            print(f"Yahoo error - {e}")
+        time.sleep(0.2)
+
     missing = [t for t in tickers if t not in descriptions]
     if missing:
-        print(f"\n  Pass 2: Yahoo Finance fallback for {len(missing)} tickers...")
+        print(f"\n  Pass 2: SEC EDGAR fallback for {len(missing)} tickers...")
         for ticker in missing:
-            try:
-                info = yf.Ticker(ticker).info
-                summary = info.get("longBusinessSummary", "")
-                if summary and len(summary) > 50:
-                    descriptions[ticker] = summary
-                    sources[ticker] = "Yahoo"
-                    print(f"    {ticker}: Yahoo ({len(summary.split())} words)")
-                else:
-                    print(f"    {ticker}: NO DESCRIPTION FOUND")
-            except Exception as e:
-                print(f"    {ticker}: Error - {e}")
-            time.sleep(0.5)
+            print(f"    {ticker}...", end=" ")
+            text = get_10k_text_edgar_v2(ticker)
+            if text:
+                descriptions[ticker] = text
+                sources[ticker] = "10-K"
+                print(f"10-K ({len(text.split())} words)")
+            else:
+                print("NO DESCRIPTION FOUND")
+            time.sleep(0.15)
     
     print(f"\n  Results: {len(descriptions)}/{len(tickers)} tickers have descriptions")
     from collections import Counter
