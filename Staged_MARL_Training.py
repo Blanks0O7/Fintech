@@ -59,6 +59,21 @@ WORKER_GAMMA_PENALTY = 0.01
 MANAGER_FAST_WINDOW = 5
 MANAGER_SLOW_WINDOW = 20
 
+# ---- Production-grade execution + risk parameters ----
+TRANSACTION_COST_BPS = 7.5      # round-trip per unit turnover (commission + spread + slippage)
+STRESS_CASH_FLOOR_HIGH = 0.40   # min cash weight in Worker when stress >= STRESS_HIGH_THRESHOLD
+STRESS_CASH_FLOOR_MED  = 0.20   # min cash weight when stress in [MED, HIGH)
+STRESS_HIGH_THRESHOLD  = 1.20
+STRESS_MED_THRESHOLD   = 0.60
+MANAGER_SAFE_FLOOR_HIGH = 0.70  # min Safe-pool weight when stress >= STRESS_HIGH_THRESHOLD
+MANAGER_SAFE_FLOOR_MED  = 0.55  # min Safe-pool weight when stress in [MED, HIGH)
+MANAGER_RISKY_CAP_HIGH  = 0.05  # max Risky-pool weight when stress >= HIGH
+MANAGER_RISKY_CAP_MED   = 0.15  # max Risky-pool weight when stress in [MED, HIGH)
+WEIGHT_DECAY = 1e-4             # L2 regularisation on all networks
+CHECKPOINT_DIR = "checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs("data/processed", exist_ok=True)
+
 # ==============================================================
 # DATA LOADING
 # ==============================================================
@@ -115,9 +130,13 @@ class WorkerEnv(gym.Env):
     def __init__(self, price_df, lexical_matrix, tickers, profile="neutral",
                  window_size=WORKER_WINDOW_SIZE,
                  lambda_penalty=WORKER_LAMBDA_PENALTY,
-                 gamma_penalty=WORKER_GAMMA_PENALTY):
+                 gamma_penalty=WORKER_GAMMA_PENALTY,
+                 transaction_cost_bps=TRANSACTION_COST_BPS):
         super().__init__()
         self.profile = profile
+        self.transaction_cost_bps = float(transaction_cost_bps)
+        # External stress signal (set by Manager each step). 0 = calm, ~3 = extreme.
+        self.external_stress = 0.0
         self.tickers = [t for t in tickers if t in price_df.columns and t in lexical_matrix.index]
         self.n_assets = len(self.tickers)
         self.n_total = self.n_assets + 1  # +1 for Cash
@@ -160,6 +179,21 @@ class WorkerEnv(gym.Env):
         w_full = np.abs(action) + 1e-8
         w_full = w_full / np.sum(w_full)
 
+        # ---- Stress-triggered cash floor (defensive overlay) ----
+        if self.external_stress >= STRESS_HIGH_THRESHOLD:
+            cash_floor = STRESS_CASH_FLOOR_HIGH
+        elif self.external_stress >= STRESS_MED_THRESHOLD:
+            cash_floor = STRESS_CASH_FLOOR_MED
+        else:
+            cash_floor = 0.0
+        if cash_floor > 0.0 and w_full[self.n_assets] < cash_floor:
+            deficit = cash_floor - w_full[self.n_assets]
+            stock_sum = np.sum(w_full[:self.n_assets])
+            if stock_sum > 1e-8:
+                w_full[:self.n_assets] *= max(0.0, 1.0 - deficit / stock_sum)
+            w_full[self.n_assets] = cash_floor
+            w_full = w_full / np.sum(w_full)
+
         delta = w_full - self.portfolio_weights
         turnover = np.sum(np.abs(delta))
         if turnover > self.TURNOVER_LIMIT:
@@ -167,7 +201,7 @@ class WorkerEnv(gym.Env):
             w_full = self.portfolio_weights + delta
             w_full = np.maximum(w_full, 0.0)
             w_full = w_full / np.sum(w_full)
-            turnover = self.TURNOVER_LIMIT
+            turnover = float(np.sum(np.abs(w_full - self.portfolio_weights)))
 
         w_stocks = w_full[:self.n_assets]
         w_cash = w_full[self.n_assets]
@@ -176,7 +210,10 @@ class WorkerEnv(gym.Env):
         nxt = self.prices[self.current_step + 1]
         pr = nxt / (curr + 1e-8)
         stock_ret = np.dot(w_stocks, pr)
-        port_ret = max(stock_ret + w_cash * 1.0, 1e-8)
+        gross_ret = max(stock_ret + w_cash * 1.0, 1e-8)
+        # Transaction cost: bps applied to total turnover (one-way notional traded)
+        tc = self.transaction_cost_bps / 10000.0 * turnover
+        port_ret = max(gross_ret * (1.0 - tc), 1e-8)
         log_ret = np.log(port_ret)
 
         if np.sum(w_stocks) > 1e-8:
@@ -236,10 +273,15 @@ class ManagerEnv(gym.Env):
                  window_size=WORKER_WINDOW_SIZE,
                  fast_window=MANAGER_FAST_WINDOW,
                  slow_window=MANAGER_SLOW_WINDOW,
-                 turnover_penalty=0.01,
-                 stress_penalty=0.20,
-                 drawdown_penalty=0.30):
+                 turnover_penalty=0.02,
+                 stress_penalty=0.40,
+                 drawdown_penalty=0.60,
+                 transaction_cost_bps=TRANSACTION_COST_BPS,
+                 worker_envs_ref=None):
         super().__init__()
+        self.transaction_cost_bps = float(transaction_cost_bps)
+        # Optional reference to worker envs so the Manager can broadcast stress.
+        self.worker_envs_ref = worker_envs_ref
         self.risk_pools = risk_pools
         self.pool_names = ['Safe', 'Neutral', 'Risky']
         self.n_pools = 3
@@ -300,6 +342,40 @@ class ManagerEnv(gym.Env):
         v = np.abs(action) + 1e-8
         v = v / np.sum(v)
 
+        # ---- Compute stress BEFORE workers act so we can broadcast it ----
+        market_context = self._get_market_context()
+        current_drawdown = float(market_context[-2])
+        stress_score = float(market_context[-1])
+        safe_idx = self.pool_names.index('Safe')
+        neutral_idx = self.pool_names.index('Neutral')
+        risky_idx = self.pool_names.index('Risky')
+
+        # ---- Hard defensive overlay: cap risky / floor safe under stress ----
+        if stress_score >= STRESS_HIGH_THRESHOLD:
+            safe_floor, risky_cap = MANAGER_SAFE_FLOOR_HIGH, MANAGER_RISKY_CAP_HIGH
+        elif stress_score >= STRESS_MED_THRESHOLD:
+            safe_floor, risky_cap = MANAGER_SAFE_FLOOR_MED, MANAGER_RISKY_CAP_MED
+        else:
+            safe_floor, risky_cap = 0.0, 1.0
+        if v[risky_idx] > risky_cap:
+            spill = v[risky_idx] - risky_cap
+            v[risky_idx] = risky_cap
+            v[safe_idx] += spill
+        if v[safe_idx] < safe_floor:
+            deficit = safe_floor - v[safe_idx]
+            non_safe_total = v[neutral_idx] + v[risky_idx]
+            if non_safe_total > 1e-8:
+                shrink = max(0.0, 1.0 - deficit / non_safe_total)
+                v[neutral_idx] *= shrink
+                v[risky_idx] *= shrink
+            v[safe_idx] = safe_floor
+        v = v / np.sum(v)
+
+        # ---- Broadcast stress to worker envs so they engage their cash floors ----
+        if self.worker_envs_ref is not None:
+            for w_env in self.worker_envs_ref.values():
+                w_env.external_stress = stress_score
+
         if worker_returns is not None:
             global_ret = sum(v[i] * worker_returns.get(name, 1.0)
                              for i, name in enumerate(self.pool_names))
@@ -310,16 +386,14 @@ class ManagerEnv(gym.Env):
             pr = nxt / (curr + 1e-8)
             global_ret = max(np.dot(v, pr), 1e-8)
 
+        # Transaction cost on pool-level rebalancing (top of worker-level costs)
+        turnover = float(np.sum(np.abs(v - self.pool_weights)))
+        tc = self.transaction_cost_bps / 10000.0 * turnover
+        global_ret = max(global_ret * (1.0 - tc), 1e-8)
         log_ret = np.log(global_ret)
-        turnover = np.sum(np.abs(v - self.pool_weights))
-        market_context = self._get_market_context()
-        current_drawdown = float(market_context[-2])
-        stress_score = float(market_context[-1])
-        neutral_idx = self.pool_names.index('Neutral')
-        risky_idx = self.pool_names.index('Risky')
 
-        stress_exposure = 0.35 * v[risky_idx] + 0.15 * v[neutral_idx]
-        drawdown_exposure = max(current_drawdown - 0.08, 0.0) * (0.50 * v[risky_idx] + 0.25 * v[neutral_idx])
+        stress_exposure = 0.50 * v[risky_idx] + 0.25 * v[neutral_idx]
+        drawdown_exposure = max(current_drawdown - 0.05, 0.0) * (0.80 * v[risky_idx] + 0.40 * v[neutral_idx])
         reward = float(
             log_ret
             - self.turnover_penalty * turnover
@@ -394,14 +468,14 @@ class EIIENetwork(nn.Module):
         self.fc2 = nn.Linear(64, n_assets)
 
     def forward(self, pw, pvm, extra_context=None):
-        feats = []
-        for i in range(self.n_price_assets):
-            x = pw[:, i, :].unsqueeze(1)
-            x = F.relu(self.conv1(x))
-            x = F.relu(self.conv2(x))
-            x = x.mean(dim=2)
-            feats.append(x)
-        inputs = feats + [pvm]
+        # pw: (B, n_price_assets, window) — process all assets at once
+        B, A, W = pw.shape
+        x = pw.reshape(B * A, 1, W)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = x.mean(dim=2)                # (B*A, 32)
+        x = x.reshape(B, A * 32)         # (B, A*32)
+        inputs = [x, pvm]
         if self.extra_context_dim:
             if extra_context is None:
                 raise ValueError("extra_context is required when extra_context_dim > 0")
@@ -474,7 +548,7 @@ def make_worker_envs(price_source, lexical_matrix, risk_pools):
     return worker_envs
 
 
-def make_manager_env(price_source, lexical_matrix, risk_pools):
+def make_manager_env(price_source, lexical_matrix, risk_pools, worker_envs_ref=None):
     return ManagerEnv(
         price_source,
         lexical_matrix,
@@ -482,6 +556,7 @@ def make_manager_env(price_source, lexical_matrix, risk_pools):
         window_size=WORKER_WINDOW_SIZE,
         fast_window=MANAGER_FAST_WINDOW,
         slow_window=MANAGER_SLOW_WINDOW,
+        worker_envs_ref=worker_envs_ref,
     )
 
 def dirichlet_mode(alpha):
@@ -628,7 +703,7 @@ def train_staged(manager_env, worker_envs,
 
     for name in pool_names:
         if name in worker_nets:
-            worker_opts[name] = optim.Adam(worker_nets[name].parameters(), lr=lr)
+            worker_opts[name] = optim.Adam(worker_nets[name].parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
             worker_schedulers[name] = optim.lr_scheduler.CosineAnnealingLR(
                 worker_opts[name], T_max=phase1_episodes, eta_min=5e-4)
 
@@ -721,7 +796,7 @@ def train_staged(manager_env, worker_envs,
         print("PHASE 2: Training Manager (Workers FROZEN)")
         print("=" * 60)
 
-    manager_opt = optim.Adam(manager_net.parameters(), lr=lr)
+    manager_opt = optim.Adam(manager_net.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     m_scheduler = optim.lr_scheduler.CosineAnnealingLR(manager_opt, T_max=phase2_episodes, eta_min=5e-4)
 
     # Freeze Worker networks
@@ -950,7 +1025,7 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
     m_n = manager_env.action_space.shape[0]
     m_ws = manager_env.window_size
     manager_net = EIIENetwork(m_n, m_ws, extra_context_dim=manager_env.extra_context_dim).to(DEVICE)
-    manager_opt = optim.Adam(manager_net.parameters(), lr=lr)
+    manager_opt = optim.Adam(manager_net.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     m_scheduler = optim.lr_scheduler.CosineAnnealingLR(manager_opt, T_max=n_episodes, eta_min=5e-4)
 
     worker_nets, worker_opts, worker_schedulers = {}, {}, {}
@@ -958,7 +1033,7 @@ def train_concurrent(manager_env, worker_envs, n_episodes=200, lr=3e-3, max_step
         if name in worker_envs:
             env = worker_envs[name]
             worker_nets[name] = EIIENetwork(env.n_total, env.window_size, n_price_assets=env.n_assets).to(DEVICE)
-            worker_opts[name] = optim.Adam(worker_nets[name].parameters(), lr=lr)
+            worker_opts[name] = optim.Adam(worker_nets[name].parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
             worker_schedulers[name] = optim.lr_scheduler.CosineAnnealingLR(
                 worker_opts[name], T_max=n_episodes, eta_min=5e-4)
 
@@ -1298,7 +1373,7 @@ worker_envs = make_worker_envs(price_df, lexical_df, risk_pools)
 for profile, env in worker_envs.items():
     print(f"  {profile} Worker: {env.n_assets} stocks")
 
-manager_env = make_manager_env(price_df, lexical_df, risk_pools)
+manager_env = make_manager_env(price_df, lexical_df, risk_pools, worker_envs_ref=worker_envs)
 print(f"  Manager: allocating across {len(worker_envs)} risk pools\n")
 
 # ---------------------------------------------------------
@@ -1329,7 +1404,7 @@ print("#" * 70)
 
 # Recreate fresh environments for fair comparison
 worker_envs_c = make_worker_envs(price_df, lexical_df, risk_pools)
-manager_env_c = make_manager_env(price_df, lexical_df, risk_pools)
+manager_env_c = make_manager_env(price_df, lexical_df, risk_pools, worker_envs_ref=worker_envs_c)
 
 t1 = time.time()
 conc_mgr_net, conc_w_nets, conc_hist = train_concurrent(
@@ -1338,7 +1413,7 @@ conc_mgr_net, conc_w_nets, conc_hist = train_concurrent(
 
 # Recreate envs for eval
 worker_envs_ce = make_worker_envs(price_df, lexical_df, risk_pools)
-manager_env_ce = make_manager_env(price_df, lexical_df, risk_pools)
+manager_env_ce = make_manager_env(price_df, lexical_df, risk_pools, worker_envs_ref=worker_envs_ce)
 
 conc_eval = evaluate_system(manager_env_ce, worker_envs_ce, conc_mgr_net, conc_w_nets, max_steps=200)
 print(f"\nConcurrent Training Time: {time.time()-t1:.1f}s")
@@ -1356,12 +1431,12 @@ print(f"  Test period: {test_prices.index[0].date()} -> {test_prices.index[-1].d
 
 # Staged on holdout
 holdout_worker_envs = make_worker_envs(test_prices, lexical_df, risk_pools)
-holdout_mgr_env = make_manager_env(test_prices, lexical_df, risk_pools)
+holdout_mgr_env = make_manager_env(test_prices, lexical_df, risk_pools, worker_envs_ref=holdout_worker_envs)
 holdout_staged_eval = evaluate_system(holdout_mgr_env, holdout_worker_envs, staged_mgr_net, staged_w_nets, max_steps=200)
 
 # Concurrent on holdout
 holdout_worker_envs_c = make_worker_envs(test_prices, lexical_df, risk_pools)
-holdout_mgr_env_c = make_manager_env(test_prices, lexical_df, risk_pools)
+holdout_mgr_env_c = make_manager_env(test_prices, lexical_df, risk_pools, worker_envs_ref=holdout_worker_envs_c)
 holdout_conc_eval = evaluate_system(holdout_mgr_env_c, holdout_worker_envs_c, conc_mgr_net, conc_w_nets, max_steps=200)
 
 # EW/MVO on holdout
@@ -1567,7 +1642,7 @@ for wf_name, train_s, train_e, test_s, test_e in wf_windows:
         continue
 
     wf_worker_envs = make_worker_envs(train_prices, lexical_df, risk_pools)
-    wf_mgr_env = make_manager_env(train_prices, lexical_df, risk_pools)
+    wf_mgr_env = make_manager_env(train_prices, lexical_df, risk_pools, worker_envs_ref=wf_worker_envs)
 
     # Staged training for walk-forward (reduced episodes for speed)
     wf_mgr_net, wf_w_nets, _ = train_staged(
@@ -1578,7 +1653,7 @@ for wf_name, train_s, train_e, test_s, test_e in wf_windows:
 
     # Test
     test_worker_envs = make_worker_envs(test_prices, lexical_df, risk_pools)
-    test_mgr_env = make_manager_env(test_prices, lexical_df, risk_pools)
+    test_mgr_env = make_manager_env(test_prices, lexical_df, risk_pools, worker_envs_ref=test_worker_envs)
     wf_eval = evaluate_system(test_mgr_env, test_worker_envs, wf_mgr_net, wf_w_nets, max_steps=200)
 
     wf_results[wf_name] = wf_eval
@@ -1618,7 +1693,7 @@ for lam in lambdas:
                 profile=profile.lower(), window_size=WORKER_WINDOW_SIZE,
                 lambda_penalty=lam, gamma_penalty=WORKER_GAMMA_PENALTY)
 
-    abl_mgr_env = make_manager_env(price_df, lexical_df, risk_pools)
+    abl_mgr_env = make_manager_env(price_df, lexical_df, risk_pools, worker_envs_ref=abl_worker_envs)
     abl_mgr_net, abl_w_nets, _ = train_staged(
         abl_mgr_env, abl_worker_envs,
         phase1_episodes=120, phase2_episodes=80, phase3_episodes=40,
@@ -1634,7 +1709,7 @@ for lam in lambdas:
                 price_df, lexical_df, pool_tickers,
                 profile=profile.lower(), window_size=WORKER_WINDOW_SIZE,
                 lambda_penalty=lam, gamma_penalty=WORKER_GAMMA_PENALTY)
-    abl_mgr_env_e = make_manager_env(price_df, lexical_df, risk_pools)
+    abl_mgr_env_e = make_manager_env(price_df, lexical_df, risk_pools, worker_envs_ref=abl_worker_envs_e)
 
     abl_eval = evaluate_system(abl_mgr_env_e, abl_worker_envs_e, abl_mgr_net, abl_w_nets, max_steps=200)
     ablation_results[lam] = abl_eval
@@ -1905,6 +1980,30 @@ with open("data/processed/staged_training_results.json", "w") as f:
     json.dump(all_results, f, indent=2, default=str)
 
 print(f"\nResults saved to data/processed/staged_training_results.json")
+
+# ==============================================================
+# CHECKPOINT SAVE - for paper trading / real-market backtest
+# ==============================================================
+ckpt_path = os.path.join(CHECKPOINT_DIR, "staged_marl_full.pt")
+torch.save({
+    'manager_state_dict': staged_mgr_net.state_dict(),
+    'worker_state_dicts': {n: net.state_dict() for n, net in staged_w_nets.items()},
+    'manager_n_assets': manager_env.action_space.shape[0],
+    'manager_window_size': manager_env.window_size,
+    'manager_extra_context_dim': manager_env.extra_context_dim,
+    'worker_specs': {n: {'n_assets': worker_envs[n].n_assets,
+                         'n_total': worker_envs[n].n_total,
+                         'window_size': worker_envs[n].window_size,
+                         'tickers': worker_envs[n].tickers}
+                     for n in staged_w_nets},
+    'risk_pools': {k: list(v) for k, v in risk_pools.items()},
+    'tickers': tickers,
+    'pool_names': ['Safe', 'Neutral', 'Risky'],
+    'training_end_date': str(price_df.index[-1].date()),
+    'transaction_cost_bps': TRANSACTION_COST_BPS,
+}, ckpt_path)
+print(f"Checkpoint saved: {ckpt_path}")
+
 print(f"\nTotal runtime: {time.time()-t0:.1f}s")
 print("\n" + "=" * 70)
 print("  DONE - Staged MARL Training Complete")
