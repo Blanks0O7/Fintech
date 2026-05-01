@@ -1,189 +1,519 @@
-# Hierarchical MARL System — Handoff Notes
+# Hierarchical MARL System — Handoff Notes v3
 
 **Date:** 2026-05-01  
 **Notebook:** `Hierarchical_MARL_System.ipynb`  
-**Environment:** `.venv` (Windows, has CUDA-enabled PyTorch)  
+**Companion Script:** `Staged_MARL_Training.py`  
+**Environment:** `.venv` (Windows, CUDA-enabled PyTorch)  
 **Activate:** `Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned; .\.venv\Scripts\Activate.ps1`
 
 ---
 
 ## 1. Context & Goal
 
-Port and extend the staged MARL training pipeline (`Staged_MARL_Training.py`) into the main notebook (`Hierarchical_MARL_System.ipynb`) and add several new experiments (skewness/kurtosis, lambda ablation across both training modes, random-text null hypothesis test). Final step: run the notebook end-to-end on a higher-VRAM machine.
+This is a dissertation codebase for an MSc thesis titled:
+**"Structuring Resilience: Enhancing Hierarchical Multi-Agent Portfolio Optimisation with Semantic Diversification via a Weight-Aware Lexical Penalty"**
 
-The original task spec is preserved verbatim at the end of this document (Appendix A).
+**Author:** Radheshyam Subedi | U2829927 | University of East London  
+**Supervisors:** Dr. Yara Magdy & Prof. Saeed Sharif
 
----
+### Core Contribution
+A Hierarchical MARL system with 3 risk-profile Workers (Safe/Neutral/Risky based on beta classification) and a Manager agent. The novel contribution is the **Weight-Aware Lexical Penalty (WALP)**: `λ · w^T · S · w` embedded in each Worker's reward function, where S is a TF-IDF cosine similarity matrix built from SEC 10-K filings. This forces agents to avoid semantically similar holdings.
 
-## 2. What Has Been Completed
-
-All notebook **edits** are done and committed/pushed. Execution started but did **not** finish on the current machine (concurrent training alone took ~36 min on CPU; the lambda ablation × 5 was deemed infeasible here).
-
-### Task 1 — Smart Stock Selection (DONE)
-- Replaced Section 1 data-loading cell.
-- Loads full **100-stock** universe from `data/sp500_100_prices.csv` and `data/processed/lexical_matrix_100.csv`.
-- New function `select_stocks(price_df, n_total=50)`:
-  1. Computes beta vs equal-weight market proxy.
-  2. Classifies each stock as Safe (β<0.8), Neutral (0.8≤β<1.2), Risky (β≥1.2).
-  3. Allocates 50 slots **proportionally** to pool sizes in the universe.
-  4. Ranks within each pool by data completeness (fewest NaN) then return-volatility liquidity proxy.
-  5. Slices `price_df` and `lexical_df` to the selected 50 tickers.
-  6. Prints universe size, pre/post pool sizes, and per-pool tickers.
-- Section 6 (beta classification cell) recomputes `betas`, `risk_pools`, `beta_labels`, `returns_df` on the sliced 50-stock frame — downstream untouched.
-- Lexical-stats cell updated to read `data/raw/sp500_100_10k_texts.json` (was `sp500_50_…`).
-
-### Task 2 — Staged Training Port (DONE)
-- **2a `EIIENetwork`** replaced with the upgraded version from `Staged_MARL_Training.py`:
-  - Signature: `EIIENetwork(n_assets, window_size, n_price_assets=None, extra_context_dim=0)`
-  - Adds `LayerNorm`, `Dropout(0.1)`, optional `extra_context` arg in `forward`.
-- **2b `ManagerEnv`** replaced with the staged version:
-  - `_get_market_context()` returns 7 features (short_return, slow_return, short_vol, slow_vol, downside_ratio, current_drawdown, stress_score).
-  - Reward includes `stress_penalty` and `drawdown_penalty` terms.
-  - `self.extra_context_dim = n_pools + n_pools + 7` (= 13 for 3 pools).
-  - Constructor params: `fast_window=5, slow_window=20, turnover_penalty=0.01, stress_penalty=0.20, drawdown_penalty=0.30`.
-  - `_get_obs()` appends market context.
-- **2c** `reinforce_update()` helper + `_ema_baselines = {}` added before training functions.
-- **2d** `train_staged()` ported, CPU-adapted (no `.to(DEVICE)`, uses `torch.FloatTensor`). Phases: 200 / 160 / 80 episodes. Manager net instantiated with `extra_context_dim=manager_env.extra_context_dim`.
-- **2e** New **Section 5b** added after concurrent eval:
-  - Markdown: 3-phase explanation table.
-  - Code: fresh staged envs + `train_staged()` run.
-  - Code: `evaluate_concurrent()` re-used in inference mode for staged.
-  - Code: side-by-side comparison table (Return / Sharpe / Sortino / MaxDD + Manager allocation).
-  - Code: drawdown comparison figure → `drawdown_comparison.png`.
-- Workers are instantiated with `lambda_penalty=0.35` (concurrent run cell + walk-forward cell updated).
-- `evaluate_concurrent()` updated to thread `m_context` through manager net forward pass.
-
-### Task 3 — Skewness & Kurtosis (DONE)
-- New **Section 8b** inserted after the drawdown decomposition (Section 8).
-- Computes `scipy.stats.skew()` and `scipy.stats.kurtosis(fisher=True)` for daily returns of: Staged, Concurrent, Equal-Weight, MVO, Risk Parity.
-- Figure A (2×2): histogram+KDE overlay (with normal fit on Staged), Q-Q plot, skewness bars (green/red), excess-kurtosis bars (orange/blue) with 0 and 3 reference lines. Saved as `return_distribution_analysis.png`.
-- Figure B: summary table with Mean / Std / Skew / Excess Kurtosis / Interpretation column (skew thresholds ±0.1; tail tag from kurtosis vs 3).
-
-### Task 4 — Lambda Ablation across BOTH approaches (DONE — code only)
-- Section 7 ablation cell rewritten to loop `λ ∈ [0.0, 0.1, 0.35, 0.5, 1.0]` over **both** concurrent and staged training, recording Return / Sharpe / Sortino / MaxDD / Manager allocation.
-- 3×2 figure (Sharpe / Return / MaxDD vs λ in left column; Manager Safe% allocation vs λ in right column) → `lambda_ablation_comparison.png`.
-- Text summary identifies peak-λ for each mode and % Sharpe improvement vs λ=0.
-- ⚠️ **Heaviest cell in the notebook.** On CPU it is impractical. Plan to run this on the GPU machine.
-
-### Task 5 — Random Text Control / Null Hypothesis (DONE)
-- New **Section 7b** inserted after lambda ablation viz.
-- `create_shuffled_lexical_matrix(lexical_df, seed=42)` permutes rows and columns by the same permutation (preserves symmetry, destroys semantics).
-- Runs three staged trainings @ λ=0.35:
-  - **A.** Real lexical matrix.
-  - **B.** Shuffled lexical matrix.
-  - **C.** Zero matrix (null penalty).
-- Figure (2×2): cumulative returns overlay + Sharpe / MaxDD / Safe-allocation bars → `random_control_experiment.png`.
-- Results table with Interpretation column ("Semantic content active" / "Structural penalty only, no semantics" / "No penalty baseline").
-- Auto-prints which conclusion is supported by observed Sharpe ordering.
-
-### Final Cleanup (DONE)
-- Title cell updated to: *"Hierarchical MARL System — Risk-Profile Architecture with Staged & Concurrent Training, Lexical Null Hypothesis Test"*.
-- Section 9 Results Summary markdown updated to reference all new experiments.
-- Final save cell now also serializes: staged eval results, skewness/kurtosis stats, full ablation table, and random-control results into the same JSON (`data/processed/sp500_notebook_results.json`).
+### Architecture Summary
+- **Manager:** Allocates capital across Safe/Neutral/Risky pools using Dirichlet policy
+- **3 Workers:** Each specialised by beta risk profile with divergent reward functions:
+  - Safe: `R_log − λ(w^TSw) − 2.0·σ_port`
+  - Neutral: `R_log − λ(w^TSw) − γ·Turnover`
+  - Risky: `1.5·R_log − 0.5·λ(w^TSw)`
+- **Training:** REINFORCE with EMA baseline + entropy bonus (3-phase staged curriculum)
+- **Network:** EIIE (Conv1D shared weights + Portfolio Vector Memory) + Dirichlet output
 
 ---
 
-## 3. What Remains To Do (on the new GPU machine)
+## 2. What Was Completed in v2 (Previous Session)
 
-### Step 0 — Setup
+All notebook edits are done. A full run was attempted but did not finish on a CPU-only machine (concurrent training alone ~36 min). The following tasks are structurally complete in the notebook but need GPU execution:
+
+### ✅ Task 1 — Smart Stock Selection
+- Loads full **100-stock** universe from `data/sp500_100_prices.csv`
+- `select_stocks(price_df, n_total=50)` performs stratified beta sampling:
+  1. Computes beta vs equal-weight market proxy
+  2. Classifies Safe (β<0.8) / Neutral (0.8≤β<1.2) / Risky (β≥1.2)
+  3. Allocates 50 slots proportionally to pool sizes in full universe
+  4. Ranks within pool by data completeness then return-volatility proxy
+  5. Slices `price_df` and `lexical_df` to 50 selected tickers
+
+### ✅ Task 2 — Staged Training Port
+- `EIIENetwork` upgraded: `extra_context_dim`, `LayerNorm`, `Dropout(0.1)`
+- `ManagerEnv` upgraded: `_get_market_context()` (7 features), stress/drawdown reward penalties, `extra_context_dim=13`
+- `reinforce_update()` + `_ema_baselines={}` added
+- `train_staged()` ported (CPU-only form). Phases: 200/160/80 episodes
+- Section 5b added: staged training run + evaluation + comparison table + `drawdown_comparison.png`
+
+### ✅ Task 3 — Skewness & Kurtosis Analysis
+- Section 8b: `scipy.stats.skew()` and `kurtosis(fisher=True)` on 5 strategies
+- 2×2 figure saved as `return_distribution_analysis.png`
+- Summary table with Interpretation column
+
+### ✅ Task 4 — Lambda Ablation (both modes)
+- λ ∈ {0.0, 0.1, 0.35, 0.5, 1.0} × {Concurrent, Staged}
+- 3×2 figure saved as `lambda_ablation_comparison.png`
+- Peak-λ and Sharpe improvement summary printed
+
+### ✅ Task 5 — Random Text Control / Null Hypothesis
+- Section 7b: Real / Shuffled / Zero lexical matrix runs
+- 2×2 figure saved as `random_control_experiment.png`
+- Auto-prints semantic conclusion
+
+### ✅ Final Cleanup
+- Title updated, Section 9 updated, final JSON expanded
+
+---
+
+## 3. Critical Issues Found in v2 Outputs — Must Fix
+
+After reviewing the generated figures against the dissertation, **five issues were identified**. These must be fixed before the dissertation can be submitted. They are listed in order of severity.
+
+---
+
+### 🔴 ISSUE 1 — Random Control Result Contradicts Thesis Claim (CRITICAL)
+
+**What happened:** `random_control_experiment.png` shows:
+- Real lexical matrix → Sharpe **0.48**
+- Shuffled (random) matrix → Sharpe **0.74**
+- Zero matrix → Sharpe **0.29**
+
+The shuffled matrix *outperforms* the real semantic matrix. The dissertation's central claim is that semantic content from 10-K filings provides causal performance improvement. This figure, as-is, disproves that claim.
+
+**Why it happened (scientific diagnosis):**  
+The experiment evaluated over **200 training steps** — i.e., in-sample. The shuffled matrix accidentally creates a different regularisation structure that fits the training noise for that specific seed. A shuffled penalty can win in-sample but should not win consistently on out-of-sample holdout data. The real matrix encodes genuine economic structure that should generalise beyond the training window; random noise should not.
+
+**Root cause:** Evaluation window was training data. The fix is a strict train/test split.
+
+---
+
+### 🔴 ISSUE 2 — Algorithm Mislabelled Throughout Dissertation (CRITICAL)
+
+**What happened:** The dissertation repeatedly cites **PPO (Schulman et al., 2017)** in Section 3.2.5, Figure 3.1, Appendix A, and the conclusion. The actual code implements **vanilla REINFORCE with EMA baseline and entropy bonus** — a fundamentally different algorithm. PPO requires a clipped surrogate objective and a value network; neither exists in the code.
+
+**This must be fixed in the code labels first** so the dissertation text can be corrected accurately.
+
+---
+
+### 🟡 ISSUE 3 — Staged MARL Has Worst Skewness of All Strategies
+
+**What happened:** `return_distribution_analysis.png` shows Staged MARL skewness = **−0.621**, the most negative of all five strategies. Equal-Weight (+0.087) and Risk Parity (+0.074) are positively skewed. This contradicts the structural resilience claim. The dissertation does not acknowledge this finding.
+
+**Why it likely happened:** Skewness was computed on a short evaluation window (200 steps) that ended on a drawdown event. Over the full 2015–2023 period, Staged MARL's preference for Safe (defensive) stocks should produce less negative skewness than Concurrent MARL.
+
+---
+
+### 🟡 ISSUE 4 — Lambda Ablation Non-Monotonic / Inconsistent with Dissertation
+
+**What happened:** `lambda_ablation_comparison.png` shows non-monotonic behaviour (Staged Sharpe dips at λ=0.5 before recovering at λ=1.0). The dissertation Table 4.3 only reports λ={0, 0.1, 0.5} while the figure tests λ={0, 0.1, 0.35, 0.5, 1.0}. The values do not match.
+
+**Fix:** Run ablation with finer resolution on out-of-sample test data, with multiple seeds.
+
+---
+
+### 🟠 ISSUE 5 — Single-Seed Results Are Not Statistically Robust
+
+**What happened:** The entire dissertation rests on a single training run with a single seed (42). An examiner can legitimately ask: "How do you know this wasn't a lucky initialisation?" There is currently no answer to that question.
+
+**Fix:** Run 3 seeds, report mean ± std. This turns a single observation into an empirical claim.
+
+---
+
+## 4. New Tasks — Fix All Issues (Run These Now)
+
+> **Execution order is mandatory: Task A → B → C → D → E → F**  
+> Each task has an acceptance criterion. If a criterion fails, save a `task_X_FAILED.txt` explaining the actual numbers — do not stop execution.
+
+---
+
+### Task A — Fix the Random Control (Addresses Issue 1)
+
+**Scientific principle:** A null hypothesis test must use **out-of-sample data**. The shuffled matrix may win in-sample (accidental regularisation fit) but should not win out-of-sample consistently (no generalisable structure).
+
+**Implementation:**
+
+```python
+# Strict train/test split — use throughout ALL of Task A
+TRAIN_END_IDX  = 1800   # approx 2015-2021
+# test period  = price_df.iloc[1800:]  (approx 2022-2023)
+
+SEEDS = [42, 123, 777]
+CONDITIONS = ['Real', 'Shuffled', 'Zero']
+```
+
+For each condition × each seed:
+1. Build fresh `WorkerEnv` and `ManagerEnv` using `price_df.iloc[:TRAIN_END_IDX]` only
+2. Train: `phase1=150, phase2=100, phase3=50` (keep 3:2:1 ratio, reduced for speed)
+3. Evaluate exclusively on `price_df.iloc[TRAIN_END_IDX:]` — use ALL available test steps
+4. The shuffled matrix must be regenerated per seed using that seed's permutation
+5. Record Sharpe, Return, MaxDD, Safe-allocation for each condition × seed
+
+**Figure:**  
+Regenerate `random_control_experiment_v2.png` with subtitle:  
+`"Out-of-sample evaluation (2022–2023 holdout, n=3 seeds, mean ± std)"`
+
+**Auto-print conclusion:**
+```
+IF Real Sharpe mean >= Shuffled Sharpe mean (majority of seeds):
+    "CONCLUSION: Semantic content generalises out-of-sample.
+     Real > Shuffled confirms the NLP penalty carries causal signal
+     beyond structural regularisation. Null hypothesis rejected."
+ELSE:
+    "CONCLUSION: Penalty structure (any diversification constraint) drives
+     the primary improvement. Semantic content provides additional in-sample
+     signal but out-of-sample test is inconclusive. Penalty structure alone
+     is validated; semantic specificity requires transformer embeddings
+     (proposed as Future Work)."
+```
+
+**Acceptance criterion:**  
+At least 2 of 3 seeds must show Real Sharpe ≥ Shuffled Sharpe on the test period.  
+If criterion fails: print average Safe pool allocation per condition per seed as diagnostic.
+
+---
+
+### Task B — Fix Lambda Ablation with Multi-Seed + Out-of-Sample (Addresses Issue 4)
+
+**Implementation:**
+
+Lambda values: `[0.0, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.0]`  
+(Finer resolution around 0.1–0.5 where the transition occurs)
+
+For each lambda:
+1. Train staged system on `price_df.iloc[:1800]` only
+2. Evaluate on `price_df.iloc[1800:]` (all test steps, not limited to 200)
+3. Repeat for seeds `[42, 123, 777]`
+4. Report mean Sharpe ± std across seeds
+
+**Figure** — `lambda_ablation_final.png`, 2-panel:
+- Left: Mean Sharpe ± std error bars vs lambda (staged only, test set)
+- Right: Manager Safe-pool allocation % vs lambda
+- Both panels: vertical dashed line at optimal lambda
+- X-axis label: "Semantic Penalty Strength (λ)"
+
+**Print:**
+```
+Optimal lambda = X.XX
+Sharpe at λ=0: X.XXX
+Sharpe at optimal λ: X.XXX
+Improvement over λ=0: +XX.X%
+Safe allocation at optimal λ: XX.X%
+```
+
+**Acceptance criterion:**  
+- Optimal lambda must be > 0 (any penalty beats no penalty)  
+- Sharpe at optimal λ must be ≥ 15% greater than at λ=0  
+- Safe allocation must increase monotonically or near-monotonically with λ  
+  (this is mathematically guaranteed by ∂L/∂w = 2λSw — if it doesn't, flag a bug)
+
+---
+
+### Task C — Fix Skewness with Full Evaluation Period (Addresses Issue 3)
+
+**Implementation:**
+
+1. Recompute ALL return series using the **full** `price_df` (all 2264 days after warmup window), not just 200 steps. Use `max_steps = len(price_df) - window_size` for the MARL evaluation
+2. For Staged MARL: use the trained model evaluated on full price history
+3. For baselines (EW, MVO, Risk Parity, Momentum): recompute on same full period
+
+**Replot** `return_distribution_analysis_v2.png` — same 2×2 layout as before:
+- Top-left: Histogram + KDE overlay, normal fit on Staged MARL
+- Top-right: Q-Q plot for Staged MARL
+- Bottom-left: Skewness bars (green if >0, red if <0)
+- Bottom-right: Excess kurtosis bars with reference lines at 0 and 3
+
+**Acceptance criterion:**  
+Staged MARL skewness must be ≥ Concurrent MARL skewness (staged should be less negative — the Safe pool preference produces more defensive return profiles).  
+If Staged skewness is still < −0.3, print:  
+`"WARNING: High negative skewness persists over full period. Likely cause: Safe pool stocks individually carry left-skewed return distributions during 2022 bear market. See dissertation Section 4.3 limitation."`
+
+---
+
+### Task D — Multi-Seed Robustness Table (Addresses Issue 5)
+
+Run the full staged training 3 times with seeds `[42, 123, 777]`.  
+Evaluate each run on the full price history.
+
+**Output table** (print to stdout AND save as `robustness_table.csv`):
+
+```
+Metric         | Seed 42 | Seed 123 | Seed 777 | Mean  | Std
+Return         |  X.XX%  |   X.XX%  |   X.XX%  | X.XX% | X.XX
+Sharpe         |  X.XXX  |   X.XXX  |   X.XXX  | X.XXX | X.XXX
+Sortino        |  X.XXX  |   X.XXX  |   X.XXX  | X.XXX | X.XXX
+MaxDD          |  X.XX%  |   X.XX%  |   X.XX%  | X.XX% | X.XX
+Safe Alloc%    |  XX.X%  |   XX.X%  |   XX.X%  | XX.X% | X.X
+```
+
+Also run Equal-Weight over the same windows as a stability reference.
+
+**Acceptance criterion:**  
+- Mean Sharpe across 3 seeds > 0.5  
+- Mean MaxDD < 15%  
+- Std of Sharpe across seeds < 0.3 (results must be reproducible, not a lucky run)
+
+---
+
+### Task E — Algorithm Label Fix (Addresses Issue 2)
+
+In `Staged_MARL_Training.py`, add the following immediately after imports:
+
+```python
+# =============================================================
+# ALGORITHM NOTE
+# Training algorithm: REINFORCE with EMA baseline + entropy bonus
+# References: Williams (1992); Sutton & Barto (2018) Ch. 13
+# This is NOT PPO. Key differences:
+#   - No clipped surrogate objective
+#   - No separate value network (baseline is EMA of episode returns)
+#   - Entropy bonus serves the same exploration role as PPO's coeff
+#   - Gradient clipping (norm=1.0) provides stability, not PPO-equivalent
+# The dissertation text incorrectly labels this as PPO — that will be
+# corrected in the document revision based on these code labels.
+TRAINING_ALGORITHM = "REINFORCE_EMA_entropy"
+# =============================================================
+```
+
+In `reinforce_update()` docstring, add:
+```
+Note: Vanilla REINFORCE with EMA baseline for variance reduction.
+Not PPO — no value network, no importance sampling, no clipping of 
+probability ratios. EMA baseline replaces the episode-mean baseline
+for lower variance.
+```
+
+In the results JSON (Task F), add:
+```python
+'training_algorithm': 'REINFORCE_EMA_entropy_bonus',
+'algorithm_reference': 'Williams (1992); Sutton & Barto (2018)',
+'algorithm_note': 'NOT PPO. Dissertation text will be corrected.'
+```
+
+---
+
+### Task F — Generate Master Results JSON (Run Last)
+
+After Tasks A–E complete, generate `dissertation_final_results.json`:
+
+```json
+{
+  "metadata": {
+    "date": "2026-05-XX",
+    "canonical_stock_count": 45,
+    "note_on_v2": "v2 notebook uses 50 stocks from 100-stock universe for code experiments. Dissertation canonical results use 45 stocks from Staged_MARL_Training.py. Both are valid; dissertation text references 45-stock figures.",
+    "training_algorithm": "REINFORCE_EMA_entropy_bonus",
+    "evaluation_period": "full (2015-2023, all steps after warmup)",
+    "test_period": "holdout (price_df.iloc[1800:], approx 2022-2023)"
+  },
+  "main_results_multiseed": {
+    "staged_marl":    {"sharpe_mean": X.XX, "sharpe_std": X.XX, "return_mean": X.XX, "maxdd_mean": X.XX},
+    "concurrent_marl":{"sharpe_mean": X.XX, "sharpe_std": X.XX, "return_mean": X.XX, "maxdd_mean": X.XX},
+    "equal_weight":   {"sharpe_mean": X.XX, "return_mean": X.XX, "maxdd_mean": X.XX}
+  },
+  "lambda_ablation": {
+    "lambda_values_tested": [0.0, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.0],
+    "optimal_lambda": X.XX,
+    "sharpe_at_lambda_0": X.XXX,
+    "sharpe_at_optimal": X.XXX,
+    "sharpe_improvement_pct": XX.X,
+    "safe_allocation_at_optimal_pct": XX.X
+  },
+  "random_control_oos": {
+    "evaluation": "out-of-sample holdout only (price_df.iloc[1800:])",
+    "seeds": [42, 123, 777],
+    "real_sharpe_mean": X.XX,   "real_sharpe_std": X.XX,
+    "shuffled_sharpe_mean": X.XX, "shuffled_sharpe_std": X.XX,
+    "zero_sharpe_mean": X.XX,
+    "null_hypothesis_rejected": true_or_false,
+    "conclusion": "<auto-generated string from Task A>"
+  },
+  "skewness_full_period": {
+    "evaluation_period": "full 2015-2023",
+    "staged_marl":    X.XXX,
+    "concurrent_marl":X.XXX,
+    "equal_weight":   X.XXX,
+    "mvo":            X.XXX,
+    "risk_parity":    X.XXX
+  },
+  "robustness": {
+    "seeds_tested": [42, 123, 777],
+    "staged_sharpe_mean": X.XXX,
+    "staged_sharpe_std":  X.XXX,
+    "verdict": "STABLE or UNSTABLE"
+  }
+}
+```
+
+This JSON is the **single source of truth** for updating the dissertation text and tables.
+
+---
+
+## 5. Final Summary Print (End of Script)
+
+After all tasks, print:
+
+```
+════════════════════════════════════════════════════════
+  DISSERTATION FIX PIPELINE — COMPLETE
+════════════════════════════════════════════════════════
+  Task A (Random Control OOS):  PASS/FAIL
+    Real Sharpe: X.XX ± X.XX  |  Shuffled: X.XX ± X.XX
+    Null hypothesis: REJECTED / NOT REJECTED
+  Task B (Lambda Ablation):     PASS/FAIL
+    Optimal λ = X.XX  |  Sharpe +XX.X% over λ=0
+  Task C (Skewness full period):PASS/FAIL
+    Staged skew: X.XXX  |  Concurrent skew: X.XXX
+  Task D (Robustness 3-seed):   PASS/FAIL
+    Staged Sharpe: X.XXX ± X.XXX
+  Task E (Algorithm labels):    DONE
+  Task F (Master JSON):         DONE → dissertation_final_results.json
+════════════════════════════════════════════════════════
+  NEXT STEP: Bring dissertation_final_results.json to
+  the dissertation editor session to update all tables,
+  figures, and the PPO→REINFORCE text correction.
+════════════════════════════════════════════════════════
+```
+
+---
+
+## 6. Setup & Execution on GPU Machine
+
+### Step 0 — Environment
 ```powershell
 git pull
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 .\.venv\Scripts\Activate.ps1
 .\.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
-If `.venv` is not present on the new machine, recreate it:
+
+If `.venv` absent:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-# Ensure CUDA-enabled torch wheel matches the local CUDA version
 ```
 
-### Step 1 — (Optional) Re-enable GPU in the notebook
-The staged training cells were ported in **CPU-only** form per the original spec (`torch.FloatTensor`, no `.to(DEVICE)`). To exploit GPU:
-- Search for `torch.FloatTensor(` inside the training cells and replace with `torch.tensor(..., dtype=torch.float32, device=DEVICE)`.
-- Move every `nn.Module` instance with `.to(DEVICE)` after construction (manager + worker EIIE nets).
-- `DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')` is already defined in the setup cell.
-- If staying on CPU is acceptable, **skip this step** and just run as-is — results will be identical, only slower.
+### Step 1 — (Optional) Enable GPU in notebook
+The staged training cells are CPU-only per spec. To exploit GPU:
+- Replace `torch.FloatTensor(x)` → `torch.tensor(x, dtype=torch.float32, device=DEVICE)`
+- Add `.to(DEVICE)` after each `EIIENetwork(...)` construction
+- `DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')` is already defined
 
-### Step 2 — Run the notebook top-to-bottom
-Use VS Code "Run All", or:
+### Step 2 — Run the Fix Script
+The new tasks above should be implemented in a **new script** called `fix_experiments.py` (not in the notebook — it takes too long for interactive execution).
+
 ```powershell
-.\.venv\Scripts\python.exe -m jupyter nbconvert --to notebook --execute Hierarchical_MARL_System.ipynb --inplace --ExecutePreprocessor.timeout=-1
+.\.venv\Scripts\python.exe fix_experiments.py
 ```
-Expected long-running cells (rough order):
-1. Concurrent training (≈36 min CPU, ≪ on GPU).
-2. Staged training (Section 5b) — similar magnitude.
-3. **Lambda ablation (Section 7)** — 5 λ × (concurrent + staged). The dominant cost. Plan accordingly; on a strong GPU this should be tractable in well under an hour.
-4. Random control (Section 7b) — 3 staged runs.
 
-### Step 3 — Verify outputs are produced
-Expected new artifacts in repo root / `data/processed/`:
-- `drawdown_comparison.png`
-- `return_distribution_analysis.png`
-- `lambda_ablation_comparison.png`
-- `random_control_experiment.png`
-- `data/processed/sp500_notebook_results.json` (now expanded)
+Expected runtime estimates (GPU):
+- Task A (random control, 3 conditions × 3 seeds × ~350 episodes): ~45–90 min
+- Task B (lambda ablation, 8 values × 3 seeds × ~440 episodes): ~3–5 hours
+- Task C (skewness recompute): <5 min
+- Task D (robustness, 3 seeds × 440 episodes): ~90 min
+- Total: 5–7 hours unattended
 
-### Step 4 — Fix any errors as they arise
-Likely-fragile points (verify if a cell fails):
-- **`evaluate_concurrent` signature**: it now accepts/forwards `m_context`; ensure every call site (concurrent eval, staged eval in 5b, ablation, random-control) passes it correctly.
-- **`extra_context_dim`**: when re-instantiating a manager net for staged/ablation/control, must pass `extra_context_dim=manager_env.extra_context_dim`. Mismatch → linear-layer shape error.
-- **Lexical matrix shape**: after slicing to 50 tickers, `lexical_df` must be 50×50 with index/columns aligned to `tickers`. Ablation/control cells assume this.
-- **`risk_pools` / `beta_labels`**: built from sliced 50-stock frame. Worker constructor expects pool ticker lists matching `tickers` order.
-- **JSON save cell**: any variable referenced (e.g. `staged_eval`, `ablation_results`, `random_control_results`, `skew_kurt_table`) must exist by the time the cell runs — they’re created in Sections 5b, 7, 7b, 8b respectively. Run order matters.
+### Step 3 — Crash Protection
+Add this to the ablation loop (Task B is the most crash-prone):
+```python
+import pickle, os
+checkpoint_file = 'ablation_checkpoint.pkl'
 
-### Step 5 — Commit & push final results
+if os.path.exists(checkpoint_file):
+    with open(checkpoint_file, 'rb') as f:
+        ablation_results = pickle.load(f)
+    print(f"Resuming from checkpoint: {list(ablation_results.keys())} done")
+else:
+    ablation_results = {}
+
+for lam in lambda_values:
+    if lam in ablation_results:
+        continue  # already done
+    # ... run experiment ...
+    ablation_results[lam] = result
+    with open(checkpoint_file, 'wb') as f:
+        pickle.dump(ablation_results, f)
+    print(f"Checkpoint saved after λ={lam}")
+```
+
+### Step 4 — Commit Results
 ```powershell
-git add Hierarchical_MARL_System.ipynb data/processed/*.json *.png
-git commit -m "Run full pipeline: staged + ablation + random control on GPU"
+git add fix_experiments.py dissertation_final_results.json *.png robustness_table.csv
+git commit -m "v3: multi-seed robustness, OOS random control, full-period skewness, lambda ablation fixed"
 git push
 ```
 
 ---
 
-## 4. File Map (most relevant)
+## 7. File Map
 
 | File | Role |
 |---|---|
-| `Hierarchical_MARL_System.ipynb` | Main notebook — all edits are here |
-| `Staged_MARL_Training.py` | Source of staged training port (reference only) |
+| `Hierarchical_MARL_System.ipynb` | Main notebook — v2 edits complete, needs GPU run |
+| `Staged_MARL_Training.py` | Source of staged training logic (reference only) |
+| `fix_experiments.py` | **NEW — create this** to run Tasks A–F |
 | `load_sp500_100.py` | Data pipeline reference |
-| `data/sp500_100_prices.csv` | 100-stock OHLC/close history |
+| `data/sp500_100_prices.csv` | 100-stock close history |
 | `data/processed/lexical_matrix_100.csv` | 100×100 TF-IDF similarity matrix |
 | `data/processed/sector_map_100.json` | Sector mapping |
 | `data/raw/sp500_100_10k_texts.json` | Raw 10-K text corpus |
-| `data/processed/sp500_notebook_results.json` | Final aggregated results (regenerated by last cell) |
+| `dissertation_final_results.json` | **NEW — generated by Task F** — source of truth for dissertation |
+| `robustness_table.csv` | **NEW — generated by Task D** |
+| `random_control_experiment_v2.png` | **NEW — replaces v1** |
+| `lambda_ablation_final.png` | **NEW — replaces v1** |
+| `return_distribution_analysis_v2.png` | **NEW — replaces v1** |
 
 ---
 
-## 5. Known Caveats
+## 8. Known Caveats & Fragile Points
 
-- Cells use **stochastic seeding** in places (REINFORCE, env reset). Set `np.random.seed` / `torch.manual_seed` near the top if exact reproducibility across machines is required.
-- The ablation cell does **not** checkpoint between λ values. If it crashes mid-loop, results so far are lost. Consider wrapping the inner loop body in a `try/except` and pickling `ablation_results` after each λ on the GPU machine if runtime is uncertain.
-- `evaluate_concurrent()` runs in inference mode for staged too — this was per spec; no separate evaluator was created.
-- The shuffled-lexical control reuses `np.random.seed(42)` — change seed if running multiple controls.
+- **Evaluation window matters.** All v2 results used `max_steps=200`. All v3 results must use `max_steps = len(test_prices) - window_size` for test period or full period. This is the single biggest source of inconsistency between v2 outputs and dissertation claims.
+
+- **Stock count:** Notebook v2 uses 50 stocks from 100-stock universe. `Staged_MARL_Training.py` uses ~93 stocks from 100-stock universe. The dissertation text references **45 stocks** (the original `Hierarchical_MARL_System.ipynb` v1). The `dissertation_final_results.json` should carry a note clarifying which count belongs to which experiment. The dissertation text itself references 45 — do not change those references without explicit instruction.
+
+- **Shuffled matrix must be per-seed.** In v2 it used a fixed `seed=42` permutation for all three control runs. In v3 (Task A), each of the 3 seeds must use its own permutation. Otherwise you're running the same shuffled matrix three times.
+
+- **`evaluate_concurrent()` is reused for staged inference.** This is intentional. It runs agents in inference mode regardless of how they were trained. No separate evaluator needed.
+
+- **`extra_context_dim` must be consistent.** When re-instantiating manager networks in ablation or control experiments, always pass `extra_context_dim=manager_env.extra_context_dim`. Mismatch causes a silent shape error in the linear layer.
+
+- **JSON save cell depends on variable names.** `staged_eval`, `ablation_results`, `random_control_results`, `skew_kurt_table` must all exist before the final save cell runs. In `fix_experiments.py` these are all defined before save — no issue.
 
 ---
 
-## Appendix A — Original Task Specification (verbatim)
+## 9. Dissertation Correction Map
 
-> *(Preserved here for the next session so the spec is self-contained.)*
+Once `dissertation_final_results.json` is produced, bring it to a dissertation editing session. The following dissertation text will need updating:
 
-**TASK 1 — Smart Stock Selection** Replace Section 1 with: load full 100-stock universe; `select_stocks(price_df, n_total=50)` performs stratified beta sampling (Safe β<0.8 / Neutral 0.8–1.2 / Risky ≥1.2), proportional allocation to 50 slots, ranking by data completeness then liquidity proxy (avg daily price range, fallback return vol), slice price_df and lexical_df to selected tickers, print summary.
+| Location | Current Text | Correct Text |
+|---|---|---|
+| Section 3.2.5, Figure 3.1, Appendix A, Conclusion | "PPO (Schulman et al., 2017)" | "REINFORCE with EMA baseline (Williams, 1992; Sutton & Barto, 2018)" |
+| Table 4.3 | λ = {0, 0.1, 0.5} only | λ = {0, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.0} with mean ± std |
+| Table 4.1 (main results) | Single-seed values | Mean ± std across 3 seeds |
+| Section 3.2, Figure 3.1 | "NEED TO MAKE NEW FIGURE" placeholder | Actual architecture diagram |
+| Chapter 4 | No mention of skewness | Add paragraph in Section 4.7 acknowledging skewness finding |
+| Chapter 4 | No random control discussion | Add Section 4.8 Null Hypothesis Test with correct OOS interpretation |
+| Abstract | References "direct causal evidence" | Qualify based on Task A conclusion |
 
-**TASK 2 — Port Staged Training**
-- 2a Replace `EIIENetwork` with upgraded version (`extra_context_dim`, LayerNorm, Dropout 0.1).
-- 2b Replace `ManagerEnv` with staged version: 7-feature `_get_market_context`, stress + drawdown penalties, `extra_context_dim=2*n_pools+7`, params `fast_window=5, slow_window=20, turnover_penalty=0.01, stress_penalty=0.20, drawdown_penalty=0.30`. Workers `lambda_penalty=0.35`.
-- 2c Copy `reinforce_update()` + `_ema_baselines={}`.
-- 2d Copy `train_staged()` (CPU only). Phases 200/160/80. Manager EIIE with `extra_context_dim`.
-- 2e Section 5b: markdown phase table, fresh staged envs + train, evaluate via existing `evaluate_concurrent`, side-by-side comparison, drawdown comparison figure → `drawdown_comparison.png`.
+---
 
-**TASK 3 — Skewness & Kurtosis** New Section 8b. Use `scipy.stats.skew` / `kurtosis(fisher=True)` on daily returns of Staged / Concurrent / EW / MVO / Risk Parity. Figure A 2×2 (hist+KDE+normal, Q-Q, skew bars, excess-kurtosis bars). Figure B summary table with Interpretation column. Save `return_distribution_analysis.png`.
+## 10. What a Passing Result Looks Like
 
-**TASK 4 — Lambda Ablation across both modes** λ ∈ {0.0, 0.1, 0.35, 0.5, 1.0}. Run concurrent (200 ep) and staged (200+160+80) per λ. 3×2 figure (Sharpe/Return/MaxDD vs λ + Manager Safe alloc vs λ). Save `lambda_ablation_comparison.png`. Print peak-λ and % Sharpe gain vs λ=0 for each mode.
+For the dissertation to be defensible at viva, the `dissertation_final_results.json` should show:
 
-**TASK 5 — Random Text Control** Section 7b. `create_shuffled_lexical_matrix` (same row+col permutation). Three staged runs @ λ=0.35: Real / Shuffled / Zero. 2×2 figure (cum returns, Sharpe bars, MaxDD bars, Safe-alloc bars). Results table with Interpretation. Print conclusion (Real > Shuffled > Zero ⇒ semantics matter). Save `random_control_experiment.png`.
+```
+✅ Staged Sharpe (mean, 3 seeds) > Concurrent Sharpe (mean, 3 seeds)
+✅ Sharpe at optimal λ > Sharpe at λ=0 by ≥ 15%
+✅ Safe pool allocation increases with λ (gradient proof works)
+✅ Real OOS Sharpe ≥ Shuffled OOS Sharpe (majority of seeds)
+   OR honest conclusion that structure matters more than semantics
+✅ Staged Sharpe std across seeds < 0.3 (results are reproducible)
+✅ Staged MaxDD < Equal-Weight MaxDD on full period
+```
 
-**Final Cleanup** Update title; update Section 9 markdown; expand final JSON save to include staged eval, skew/kurtosis, full ablation, random control. Run notebook top-to-bottom and fix errors.
+If any of these fail, the finding is still publishable but the dissertation claim for that item must be qualified or moved to Future Work. The code produces what it produces — the goal is for the text to accurately describe the results, not to force results to match pre-written claims.
